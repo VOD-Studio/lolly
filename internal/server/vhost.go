@@ -5,6 +5,10 @@
 //   - 基于 Host 头的请求分发
 //   - 默认主机 fallback 机制
 //
+// 主机名匹配规则由 internal/hostmatch 提供，TLS SNI 证书选择
+// （internal/ssl.SNIManager）使用相同的匹配规则，确保握手阶段选中的
+// 证书与请求实际路由到的虚拟主机一致。
+//
 // 主要用途：
 //
 //	用于支持多域名虚拟主机场景，根据请求的 Host 头分发到不同的处理器。
@@ -17,11 +21,8 @@
 package server
 
 import (
-	"fmt"
-	"regexp"
-	"strings"
-
 	"github.com/valyala/fasthttp"
+	"rua.plus/lolly/internal/hostmatch"
 	"rua.plus/lolly/internal/netutil"
 	"rua.plus/lolly/internal/utils"
 )
@@ -32,17 +33,7 @@ import (
 // 支持默认主机作为未匹配请求的 fallback。
 // 支持精确匹配、前缀通配（*.example.com）、后缀通配（example.*）和正则匹配。
 type VHostManager struct {
-	hosts             map[string]*VirtualHost
-	wildcardSuffixMap map[string]*VirtualHost // suffix -> vhost
-	wildcardTLDMap    map[string]*VirtualHost // TLD -> vhost
-	regexHosts        []*RegexHostMatcher
-	defaultHost       *VirtualHost
-}
-
-// RegexHostMatcher 正则主机匹配器。
-type RegexHostMatcher struct {
-	vhost   *VirtualHost
-	pattern *regexp.Regexp
+	matcher *hostmatch.Matcher[*VirtualHost]
 }
 
 // VirtualHost 虚拟主机。
@@ -61,12 +52,7 @@ type VirtualHost struct {
 // 返回值：
 //   - *VHostManager: 新创建的管理器实例
 func NewVHostManager() *VHostManager {
-	return &VHostManager{
-		hosts:             make(map[string]*VirtualHost),
-		wildcardSuffixMap: make(map[string]*VirtualHost),
-		wildcardTLDMap:    make(map[string]*VirtualHost),
-		regexHosts:        make([]*RegexHostMatcher, 0),
-	}
+	return &VHostManager{matcher: hostmatch.New[*VirtualHost]()}
 }
 
 // AddHost 添加虚拟主机。
@@ -84,45 +70,7 @@ func NewVHostManager() *VHostManager {
 // 返回值：
 //   - error: 正则表达式无效时返回错误
 func (v *VHostManager) AddHost(name string, handler fasthttp.RequestHandler) error {
-	if strings.HasPrefix(name, "~") {
-		// 正则匹配
-		pattern := name[1:]
-		re, err := regexp.Compile(pattern)
-		if err != nil {
-			return fmt.Errorf("invalid regex pattern: %w", err)
-		}
-		v.regexHosts = append(v.regexHosts, &RegexHostMatcher{
-			pattern: re,
-			vhost: &VirtualHost{
-				name:    name,
-				handler: handler,
-			},
-		})
-		return nil
-	} else if strings.HasPrefix(name, "*.") {
-		// 前缀通配 *.example.com
-		suffix := name[2:]
-		v.wildcardSuffixMap[suffix] = &VirtualHost{
-			name:    name,
-			handler: handler,
-		}
-		return nil
-	} else if strings.HasSuffix(name, ".*") {
-		// 后缀通配 example.*
-		tld := name[:len(name)-2]
-		v.wildcardTLDMap[tld] = &VirtualHost{
-			name:    name,
-			handler: handler,
-		}
-		return nil
-	} else {
-		// 精确匹配
-		v.hosts[name] = &VirtualHost{
-			name:    name,
-			handler: handler,
-		}
-		return nil
-	}
+	return v.matcher.Add(name, &VirtualHost{name: name, handler: handler})
 }
 
 // SetDefault 设置默认主机。
@@ -130,31 +78,7 @@ func (v *VHostManager) AddHost(name string, handler fasthttp.RequestHandler) err
 // 参数：
 //   - handler: 默认主机的请求处理器
 func (v *VHostManager) SetDefault(handler fasthttp.RequestHandler) {
-	v.defaultHost = &VirtualHost{
-		name:    "default",
-		handler: handler,
-	}
-}
-
-// findLongestWildcardPrefix 查找最长的通配符前缀匹配。
-//
-// 按 nginx 规则，从最长子域名开始匹配，例如：
-// "a.b.example.com" 优先匹配 "*.b.example.com"，其次 "*.example.com"。
-//
-// 参数：
-//   - host: 主机名
-//
-// 返回值：
-//   - *VirtualHost: 匹配的虚拟主机，未匹配返回 nil
-func (v *VHostManager) findLongestWildcardPrefix(host string) *VirtualHost {
-	parts := strings.Split(host, ".")
-	for i := 1; i < len(parts); i++ {
-		suffix := strings.Join(parts[i:], ".")
-		if vhost, ok := v.wildcardSuffixMap[suffix]; ok {
-			return vhost
-		}
-	}
-	return nil
+	v.matcher.SetDefault(&VirtualHost{name: "default", handler: handler})
 }
 
 // FindHost 根据主机名查找虚拟主机。
@@ -170,36 +94,13 @@ func (v *VHostManager) findLongestWildcardPrefix(host string) *VirtualHost {
 //   - host: 主机名
 //
 // 返回值：
-//   - *VirtualHost: 匹配的虚拟主机
+//   - *VirtualHost: 匹配的虚拟主机，未匹配返回 nil
 func (v *VHostManager) FindHost(host string) *VirtualHost {
-	// 1. 精确匹配
-	if vhost, ok := v.hosts[host]; ok {
-		return vhost
+	vhost, ok := v.matcher.Find(host)
+	if !ok {
+		return nil
 	}
-
-	// 2. 最长前缀通配 *.example.com
-	if vhost := v.findLongestWildcardPrefix(host); vhost != nil {
-		return vhost
-	}
-
-	// 3. 后缀通配 example.*
-	parts := strings.Split(host, ".")
-	if len(parts) >= 2 {
-		tld := parts[0]
-		if vhost, ok := v.wildcardTLDMap[tld]; ok {
-			return vhost
-		}
-	}
-
-	// 4. 正则匹配（按配置顺序）
-	for _, m := range v.regexHosts {
-		if m.pattern.MatchString(host) {
-			return m.vhost
-		}
-	}
-
-	// 5. 默认主机
-	return v.defaultHost
+	return vhost
 }
 
 // Handler 返回虚拟主机选择器。
