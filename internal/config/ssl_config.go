@@ -38,9 +38,86 @@ type SSLConfig struct {
 	Protocols      []string             `yaml:"protocols"`
 	Ciphers        []string             `yaml:"ciphers"`
 	SessionTickets SessionTicketsConfig `yaml:"session_tickets"`
+	ACME           ACMEConfig           `yaml:"acme"`
 	HTTP2          HTTP2Config          `yaml:"http2"`
 	HSTS           HSTSConfig           `yaml:"hsts"`
 	OCSPStapling   bool                 `yaml:"ocsp_stapling"`
+}
+
+// ACME 挑战类型常量。
+const (
+	// ACMEChallengeTLSALPN01 通过 TLS ALPN 扩展验证（默认，无需 80 端口）
+	ACMEChallengeTLSALPN01 = "tls-alpn-01"
+	// ACMEChallengeHTTP01 在 /.well-known/acme-challenge/ 放置文件验证（需 80 端口）
+	ACMEChallengeHTTP01 = "http-01"
+)
+
+// DefaultACMEDirectory Let's Encrypt 生产环境 ACME 目录 URL。
+const DefaultACMEDirectory = "https://acme-v02.api.letsencrypt.org/directory"
+
+// DefaultACMEStagingDirectory Let's Encrypt 测试环境 ACME 目录 URL。
+//
+// 测试环境不受速率限制影响，但签发的证书不被浏览器信任，仅用于调试。
+const DefaultACMEStagingDirectory = "https://acme-staging-v02.api.letsencrypt.org/directory"
+
+// ACMEConfig ACME（Let's Encrypt）自动证书签发/续期配置。
+//
+// 启用后 lolly 会作为 ACME 客户端，向 CA 自动申请并在证书到期前自动
+// 续期，无需 certbot/acme-companion 等外部工具。证书与账户状态持久化在
+// StatePath 目录，进程重启后复用，避免重复申请触发 CA 速率限制。
+//
+// 与 nginx `ngx_http_acme_module` 的对应关系：
+//   - acme_issuer 的 uri/contact/challenge/state_path/account_key 对应
+//     本结构体的 Directory/Email/Challenge/StatePath 等字段
+//   - acme_certificate 的标识符列表对应 Hosts（为空时使用 server_names）
+//
+// 注意事项：
+//   - Cert/Key 已配置时优先使用静态证书，ACME 配置被忽略
+//   - tls-alpn-01 挑战不依赖 80 端口，是纯 TLS 服务端最省心的选择
+//   - http-01 挑战要求 80 端口可被 CA 访问，并由 lolly 处理挑战请求
+//   - 通配符域名（*.example.com）需要 DNS-01 挑战，本实现不支持
+//   - 使用本功能即表示同意 CA 的服务条款（TOS）
+//
+// 使用示例：
+//
+//	ssl:
+//	  acme:
+//	    enabled: true
+//	    email: "admin@example.com"
+//	    state_path: "/var/lib/lolly/acme"
+//	    challenge: "tls-alpn-01"
+type ACMEConfig struct {
+	// Directory ACME 服务器目录 URL
+	// 默认使用 Let's Encrypt 生产环境，测试时可改为 DefaultACMEStagingDirectory
+	Directory string `yaml:"directory"`
+
+	// Email 联系邮箱
+	// 用于账户注册和证书问题通知，建议配置
+	Email string `yaml:"email"`
+
+	// StatePath 状态持久化目录
+	// 存放账户私钥和已签发证书，默认 /var/lib/lolly/acme
+	// 目录权限应为 0700
+	StatePath string `yaml:"state_path"`
+
+	// Challenge 挑战类型
+	// 可选值：tls-alpn-01（默认，无需 80 端口）、http-01（需 80 端口）
+	Challenge string `yaml:"challenge"`
+
+	// Hosts 申请证书的域名列表
+	// 为空时使用服务器的 server_names（无 server_names 时使用 name）
+	Hosts []string `yaml:"hosts"`
+
+	// EABKid 外部账户绑定 Key ID（可选）
+	// 仅在使用支持 EAB 的 CA（如 ZeroSSL、Google CA）时需要
+	EABKid string `yaml:"eab_kid"`
+
+	// EABHmacKey 外部账户绑定 HMAC 密钥（可选）
+	// base64url 编码（RFC 4648 §5，无 padding），与 EABKid 配对使用
+	EABHmacKey string `yaml:"eab_hmac_key"`
+
+	// Enabled 是否启用 ACME 自动证书
+	Enabled bool `yaml:"enabled"`
 }
 
 // HSTSConfig HTTP Strict Transport Security 配置。

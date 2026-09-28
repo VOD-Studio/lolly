@@ -91,6 +91,7 @@ docs/config/
 | `add_header Strict-Transport-Security` | `ssl.hsts` |
 | `ssl_verify_client` | `ssl.client_verify.mode` |
 | `ssl_client_certificate` | `ssl.client_verify.client_ca` |
+| `acme_issuer` / `acme_certificate` | `ssl.acme`（内置 ACME 自动签发/续期，无需 certbot） |
 
 ### 安全
 
@@ -133,6 +134,38 @@ docs/config/
 | TCP/UDP Stream | ✓ `stream` 配置 |
 | URL 重写 | ✓ `rewrite` 配置 |
 | Lua 脚本 | ✓ 内置 Lua 沙箱 |
+
+## ACME 自动证书（Let's Encrypt）
+
+lolly 内置 ACME 客户端，可直接向 Let's Encrypt 等 CA 申请证书并在到期前
+自动续期，无需 certbot / acme-companion 等外部工具。对应 nginx 的
+`ngx_http_acme_module`（`acme_issuer` + `acme_certificate`）。
+
+```yaml
+servers:
+  - listen: ":443"
+    name: "example.com"                 # 或 server_names: [example.com, www.example.com]
+    ssl:
+      acme:
+        enabled: true
+        email: "admin@example.com"
+        directory: "https://acme-v02.api.letsencrypt.org/directory"
+        state_path: "/var/lib/lolly/acme"   # 账户与证书持久化目录（0600/0700）
+        challenge: "tls-alpn-01"            # 或 http-01（需 80 端口可达）
+    # 不要再配置 ssl.cert / ssl.key，否则会优先使用静态证书
+```
+
+要点：
+
+- **挑战类型**：`tls-alpn-01`（默认）不依赖 80 端口，适合纯 TLS 服务端；
+  `http-01` 要求 CA 能访问 80 端口，并由 lolly 自动响应
+  `/.well-known/acme-challenge/` 请求。
+- **域名来源**：`ssl.acme.hosts` 显式配置优先，其次 `server_names`，最后 `name`。
+- **静态证书优先**：同时配置 `ssl.cert`/`ssl.key` 时忽略 ACME 并告警。
+- **速率限制**：证书与账户状态持久化在 `state_path`，进程重启后复用；
+  调试时可将 `directory` 改为 `https://acme-staging-v02.api.letsencrypt.org/directory`。
+- **限制**：通配符域名需要 DNS-01 挑战，当前暂不支持。
+- **多虚拟主机**：每个 `server` 可独立配置 `ssl.acme`，SNI 握手时按域名签发。
 
 ## 统计
 

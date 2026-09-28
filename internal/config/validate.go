@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"regexp"
 	"slices"
 	"strings"
@@ -205,6 +206,11 @@ func validateServer(s *ServerConfig, isDefault bool) error {
 	// 验证 SSL 配置
 	if err := validateSSL(&s.SSL); err != nil {
 		return fmt.Errorf("ssl: %w", err)
+	}
+
+	// 验证 ACME 配置（需要 server_name 上下文以推导申请域名）
+	if err := validateACME(&s.SSL.ACME, s.ServerNames, s.Name); err != nil {
+		return fmt.Errorf("ssl.acme: %w", err)
 	}
 
 	// 验证安全配置
@@ -597,19 +603,22 @@ func validateProxy(p *ProxyConfig) error {
 //   - 拒绝不安全的加密套件（RC4、DES、3DES、CBC）
 //   - HTTP/2 配置仅在配置了 SSL 时生效
 func validateSSL(s *SSLConfig) error {
+	// 是否具备 TLS 能力：静态证书或 ACME 自动证书
+	hasTLS := (s.Cert != "" && s.Key != "") || s.ACME.Enabled
+
 	// 验证 HTTP/2 配置
-	if err := validateHTTP2(&s.HTTP2, s.Cert != "" && s.Key != ""); err != nil {
+	if err := validateHTTP2(&s.HTTP2, hasTLS); err != nil {
 		return fmt.Errorf("http2: %w", err)
 	}
 
-	// 未配置 SSL 时跳过验证
-	if s.Cert == "" && s.Key == "" {
-		return nil
+	// 证书和私钥必须同时配置
+	if (s.Cert == "") != (s.Key == "") {
+		return errors.New("cert 和 key 必须同时配置")
 	}
 
-	// 证书和私钥必须同时配置
-	if s.Cert == "" || s.Key == "" {
-		return errors.New("cert 和 key 必须同时配置")
+	// 未配置静态证书时跳过后续校验；启用 ACME 时证书由 CA 动态签发
+	if s.Cert == "" && s.Key == "" {
+		return nil
 	}
 
 	// 验证 TLS 版本
@@ -633,6 +642,57 @@ func validateSSL(s *SSLConfig) error {
 	}
 
 	return nil
+}
+
+// validateACME 验证 ACME 自动证书配置。
+//
+// 校验挑战类型、目录 URL、EAB 配对以及申请域名的可推导性。
+// ACME 的域名来源优先顺序与运行时一致：hosts 显式配置 > server_names > name。
+//
+// 参数：
+//   - a: ACME 配置对象
+//   - serverNames: 服务器配置的 server_names 列表
+//   - name: 服务器名称（无 server_names 时作为域名来源）
+//
+// 返回值：
+//   - error: 验证失败时返回具体错误信息，成功返回 nil
+//
+// 验证规则：
+//   - challenge 仅允许 tls-alpn-01 或 http-01（空值等价于 tls-alpn-01）
+//   - directory 非空时必须是合法的 http(s) URL
+//   - eab_kid 和 eab_hmac_key 必须同时配置或同时为空
+//   - 必须能从 hosts、server_names 或 name 中推导出至少一个域名
+func validateACME(a *ACMEConfig, serverNames []string, name string) error {
+	if !a.Enabled {
+		return nil
+	}
+
+	// 挑战类型
+	validChallenges := []string{"", ACMEChallengeTLSALPN01, ACMEChallengeHTTP01}
+	if err := ValidateEnum(a.Challenge, validChallenges, "challenge"); err != nil {
+		return fmt.Errorf("无效的 challenge: %s（仅支持 %s 或 %s）",
+			a.Challenge, ACMEChallengeTLSALPN01, ACMEChallengeHTTP01)
+	}
+
+	// 目录 URL
+	if a.Directory != "" {
+		u, err := url.Parse(a.Directory)
+		if err != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") {
+			return fmt.Errorf("无效的 directory URL: %s", a.Directory)
+		}
+	}
+
+	// EAB 必须成对配置
+	if (a.EABKid == "") != (a.EABHmacKey == "") {
+		return errors.New("eab_kid 和 eab_hmac_key 必须同时配置")
+	}
+
+	// 域名来源缺失时无法申请证书
+	if len(a.Hosts) == 0 && len(serverNames) == 0 && name == "" {
+		return errors.New("启用 ACME 时必须配置 hosts 或 server_names")
+	}
+
+	return ValidateNoNullByte(a.StatePath, "state_path")
 }
 
 // validateSecurity 验证安全配置。

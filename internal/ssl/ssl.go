@@ -69,6 +69,9 @@ type TLSManager struct {
 	// sessionTicketMgr Session Ticket 管理器
 	sessionTicketMgr *SessionTicketManager
 
+	// acmeManager ACME 自动证书管理器（启用时非 nil）
+	acmeManager *ACMEManager
+
 	// clientVerifier 客户端证书验证器
 	clientVerifier *ClientVerifier
 
@@ -85,37 +88,96 @@ type TLSManager struct {
 	mu sync.RWMutex
 }
 
+// TLSManagerOption 用于向 TLSManager 注入可选的外部依赖。
+//
+// 目前用于注入由调用方预先创建的 ACMEManager：调用方需要保证
+// 同一个 ACMEManager 实例同时被 TLS 握手与 HTTP-01 挑战处理复用。
+type TLSManagerOption func(*TLSManager)
+
+// WithACMEManager 注入预先创建的 ACME 管理器。
+//
+// 参数：
+//   - mgr: ACME 管理器，可为 nil（此时由 NewTLSManager 自行创建）
+//
+// 返回值：
+//   - TLSManagerOption: 应用于 TLSManager 的选项函数
+func WithACMEManager(mgr *ACMEManager) TLSManagerOption {
+	return func(m *TLSManager) {
+		m.acmeManager = mgr
+	}
+}
+
 // NewTLSManager 创建新的 TLS 配置管理器。
 //
-// 对于单服务器模式，传入单个 SSLConfig。
+// 对于单服务器模式，传入单个 SSLConfig。证书来源有两种：
+//   - 静态证书：配置了 Cert/Key，优先使用
+//   - ACME 自动证书：未配置 Cert/Key 且启用 cfg.ACME 时动态签发
 //
 // 参数：
 //   - cfg: SSL 配置，包含证书路径和 TLS 设置
+//   - opts: 可选注入项，如预先创建的 ACME 管理器
 //
 // 返回值：
 //   - *TLSManager: 配置好的 TLS 管理器
 //   - error: 证书加载失败或配置无效时返回错误
-func NewTLSManager(cfg *config.SSLConfig) (*TLSManager, error) {
+func NewTLSManager(cfg *config.SSLConfig, opts ...TLSManagerOption) (*TLSManager, error) {
 	if cfg == nil {
 		return nil, errors.New("ssl config is nil")
 	}
 
-	if cfg.Cert == "" || cfg.Key == "" {
-		return nil, errors.New("certificate and key paths are required")
+	manager := &TLSManager{
+		certificates: make(map[string]*x509.Certificate),
+		issuers:      make(map[string]*x509.Certificate),
+	}
+	for _, opt := range opts {
+		opt(manager)
 	}
 
-	// 加载证书
-	cert, err := loadCertificate(cfg.Cert, cfg.Key, cfg.CertChain)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load certificate: %w", err)
+	// 判断证书来源：静态证书优先，未配置时回退到 ACME 自动证书
+	useACME := cfg.Cert == "" || cfg.Key == ""
+	var cert tls.Certificate
+	var err error
+
+	if !useACME {
+		// 加载静态证书
+		cert, err = loadCertificate(cfg.Cert, cfg.Key, cfg.CertChain)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load certificate: %w", err)
+		}
+		if cfg.ACME.Enabled {
+			logging.Warn().Msg("同时配置了静态证书与 ACME，已优先使用静态证书并忽略 ACME")
+		}
+	} else {
+		// 未配置静态证书，必须启用 ACME 才能提供证书
+		if !cfg.ACME.Enabled {
+			return nil, errors.New("certificate and key paths are required")
+		}
+		if manager.acmeManager == nil {
+			acmeMgr, acmeErr := NewACMEManager(&cfg.ACME, cfg.ACME.Hosts)
+			if acmeErr != nil {
+				return nil, fmt.Errorf("failed to initialize ACME: %w", acmeErr)
+			}
+			manager.acmeManager = acmeMgr
+		}
+		if manager.acmeManager == nil {
+			return nil, errors.New("acme is enabled but manager initialization returned nil")
+		}
 	}
 
 	// 创建 TLS 配置，使用安全默认值
 	tlsCfg := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS12, // 强制 TLS 1.2 最低版本
-		MaxVersion:   tls.VersionTLS13,
-		NextProtos:   []string{"h2", "http/1.1"}, // 启用 HTTP/2 ALPN 支持
+		MinVersion: tls.VersionTLS12, // 强制 TLS 1.2 最低版本
+		MaxVersion: tls.VersionTLS13,
+		NextProtos: []string{"h2", "http/1.1"}, // 启用 HTTP/2 ALPN 支持
+	}
+
+	if useACME {
+		// ACME 自动证书：握手时按 SNI 动态获取
+		tlsCfg.GetCertificate = manager.acmeManager.GetCertificate
+		// tls-alpn-01 挑战要求 ALPN 中包含 acme-tls/1
+		tlsCfg.NextProtos = append(tlsCfg.NextProtos, ACMEALPNProto())
+	} else {
+		tlsCfg.Certificates = []tls.Certificate{cert}
 	}
 
 	// 应用 TLS 1.2 的加密套件
@@ -140,11 +202,6 @@ func NewTLSManager(cfg *config.SSLConfig) (*TLSManager, error) {
 		tlsCfg.MaxVersion = maxVer
 	}
 
-	manager := &TLSManager{
-		certificates: make(map[string]*x509.Certificate),
-		issuers:      make(map[string]*x509.Certificate),
-	}
-
 	// 初始化 Session Tickets（如果启用）
 	if cfg.SessionTickets.Enabled {
 		sessionTicketMgr, err := NewSessionTicketManager(cfg.SessionTickets)
@@ -159,7 +216,11 @@ func NewTLSManager(cfg *config.SSLConfig) (*TLSManager, error) {
 	}
 
 	// 初始化 OCSP Stapling（如果启用）
-	if cfg.OCSPStapling {
+	// ACME 自动证书在握手时才产生，静态 OCSP 预取无意义，此处仅对静态证书生效
+	if cfg.OCSPStapling && useACME {
+		logging.Warn().Msg("ACME 自动证书与 OCSP Stapling 同时启用，已跳过 OCSP 预取")
+	}
+	if cfg.OCSPStapling && !useACME {
 		ocspMgr := NewOCSPManager(DefaultOCSPConfig())
 		manager.ocspManager = ocspMgr
 
@@ -220,6 +281,19 @@ func (m *TLSManager) GetTLSConfig() *tls.Config {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.defaultCfg
+}
+
+// ACMEManager 返回该管理器使用的 ACME 管理器。
+//
+// 未启用 ACME 时返回 nil。调用方（如 HTTP-01 挑战路由）需要与
+// TLS 握手复用同一实例以获得正确的挑战令牌。
+//
+// 返回值：
+//   - *ACMEManager: ACME 管理器，未启用时为 nil
+func (m *TLSManager) ACMEManager() *ACMEManager {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.acmeManager
 }
 
 // Close 停止 OCSP 管理器和 Session Ticket 管理器并释放资源。

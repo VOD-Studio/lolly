@@ -48,6 +48,9 @@ import (
 
 const networkTCP = "tcp"
 
+// acmeChallengePath ACME http-01 挑战请求的路径前缀。
+const acmeChallengePath = "/.well-known/acme-challenge/"
+
 // Server HTTP 服务器，封装 fasthttp.Server 并提供中间件链和生命周期管理。
 //
 // 该结构体是服务器的核心实体，负责：
@@ -65,6 +68,7 @@ type Server struct {
 	tlsManager          *ssl.TLSManager
 	tlsManagers         []*ssl.TLSManager
 	sniManagers         []*ssl.SNIManager
+	acmeManagers        []*ssl.ACMEManager
 	tlsManagersMu       sync.Mutex
 	accessLogMiddleware *accesslog.AccessLog
 	luaEngine           *lua.LuaEngine
@@ -300,6 +304,11 @@ func (s *Server) Start() error {
 
 	// 记录启动时间
 	s.startTime = time.Now()
+
+	// 初始化 ACME 自动证书管理器（须在注册路由与创建 TLS 之前）
+	if err := s.initACMEManagers(); err != nil {
+		return err
+	}
 
 	// 初始化 GoroutinePool
 	s.pool = initGoroutinePool(&s.config.Performance)
@@ -577,6 +586,11 @@ func (s *Server) startSingleMode() error {
 		}
 	}
 
+	// 注册 ACME http-01 挑战路由（tls-alpn-01 无需注册）
+	if err := s.registerACMEChallengeLocation(s.locationEngine); err != nil {
+		return err
+	}
+
 	if err := s.registerProxyRoutesWithLocationEngine(serverCfg); err != nil {
 		return err
 	}
@@ -616,7 +630,7 @@ func (s *Server) startSingleMode() error {
 
 	s.running.Store(true)
 
-	return s.startServer(serverCfg, s.fastServer)
+	return s.startServer(0, serverCfg, s.fastServer)
 }
 
 // startVHostMode 虚拟主机模式启动。
@@ -639,6 +653,9 @@ func (s *Server) startVHostMode() error {
 
 		// 静态文件
 		s.registerStaticHandlers(router, &s.config.Servers[i])
+
+		// ACME http-01 挑战路由
+		s.registerACMEChallengeRouter(router)
 
 		// 为每个虚拟主机构建独立的中间件链
 		chain, err := s.buildMiddlewareChain(&s.config.Servers[i])
@@ -676,6 +693,9 @@ func (s *Server) startVHostMode() error {
 		// 静态文件
 		s.registerStaticHandlers(router, defaultSrv)
 
+		// ACME http-01 挑战路由
+		s.registerACMEChallengeRouter(router)
+
 		chain, err := s.buildMiddlewareChain(defaultSrv)
 		if err != nil {
 			return err
@@ -706,7 +726,7 @@ func (s *Server) startVHostMode() error {
 			break
 		}
 	}
-	sniMgr, err := ssl.BuildSNIManager(s.config.Servers, defaultIdx)
+	sniMgr, err := ssl.BuildSNIManager(s.config.Servers, defaultIdx, ssl.WithSNIACMEManagers(s.acmeManagerMap()))
 	if err != nil {
 		return fmt.Errorf("failed to build SNI manager: %w", err)
 	}
@@ -720,7 +740,7 @@ func (s *Server) startVHostMode() error {
 
 	s.running.Store(true)
 
-	return s.startServer(serverCfg, s.fastServer)
+	return s.startServer(0, serverCfg, s.fastServer)
 }
 
 // startMultiServerMode 多服务器模式启动。
@@ -774,6 +794,9 @@ func (s *Server) startMultiServerMode() error {
 			// 静态文件服务
 			s.registerStaticHandlers(router, serverCfg)
 
+			// ACME http-01 挑战路由
+			s.registerACMEChallengeRouter(router)
+
 			// 应用中间件链、连接池包装和统计追踪
 			h, err := s.wrapHandler(router.Handler(), serverCfg)
 			if err != nil {
@@ -784,9 +807,10 @@ func (s *Server) startMultiServerMode() error {
 			// 创建 fasthttp.Server
 			fastSrv := s.createFastServer(serverCfg, h)
 
-			// 检查 SSL 配置
-			if serverCfg.SSL.Cert != "" && serverCfg.SSL.Key != "" {
-				tlsManager, err := ssl.NewTLSManager(&serverCfg.SSL)
+			// 检查 SSL 配置（静态证书或 ACME 自动证书）
+			hasTLS := (serverCfg.SSL.Cert != "" && serverCfg.SSL.Key != "") || serverCfg.SSL.ACME.Enabled
+			if hasTLS {
+				tlsManager, err := ssl.NewTLSManager(&serverCfg.SSL, ssl.WithACMEManager(s.acmeManagerAt(idx)))
 				if err != nil {
 					errCh <- fmt.Errorf("failed to create TLS manager (server[%d]): %w", idx, err)
 					return
@@ -923,15 +947,24 @@ func (s *Server) wrapHandler(base fasthttp.RequestHandler, serverCfg *config.Ser
 // 如果 fastSrv.TLSConfig 已经设置（例如虚拟主机模式下由 SNIManager
 // 预先配置的多证书 TLS 配置），则直接使用现有配置，不再基于
 // serverCfg.SSL 创建新的单证书 TLSManager。
-func (s *Server) startServer(serverCfg *config.ServerConfig, fastSrv *fasthttp.Server) error {
+//
+// 参数：
+//   - idx: serverCfg 在 config.Servers 中的索引，用于取用对应的 ACME 管理器
+//   - serverCfg: 服务器配置
+//   - fastSrv: 待启动的 fasthttp.Server
+//
+// 返回值：
+//   - error: 监听或 TLS 初始化失败时返回错误
+func (s *Server) startServer(idx int, serverCfg *config.ServerConfig, fastSrv *fasthttp.Server) error {
 	ln, err := s.createListener(serverCfg)
 	if err != nil {
 		return fmt.Errorf("failed to listen: %w", err)
 	}
 	s.listeners = append(s.listeners, ln)
 
-	if fastSrv.TLSConfig == nil && serverCfg.SSL.Cert != "" && serverCfg.SSL.Key != "" {
-		tlsManager, err := ssl.NewTLSManager(&serverCfg.SSL)
+	hasTLS := (serverCfg.SSL.Cert != "" && serverCfg.SSL.Key != "") || serverCfg.SSL.ACME.Enabled
+	if fastSrv.TLSConfig == nil && hasTLS {
+		tlsManager, err := ssl.NewTLSManager(&serverCfg.SSL, ssl.WithACMEManager(s.acmeManagerAt(idx)))
 		if err != nil {
 			return fmt.Errorf("failed to create TLS manager: %w", err)
 		}

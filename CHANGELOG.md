@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **ssl**: 内置 ACME（Let's Encrypt）自动证书签发/续期，支持 `ssl.acme` 配置块
+  - 无需 certbot/acme-companion 等外部工具即可申请与续期证书
+  - 支持 `tls-alpn-01`（默认，无 80 端口依赖）与 `http-01` 挑战
+  - 支持自定义 ACME 目录（生产/测试环境）、联系邮箱、状态持久化目录
+  - 支持 EAB（外部账户绑定）与域名白名单（防止任意 SNI 刷证书）
+  - 证书状态持久化到 `state_path`，进程重启后复用，避免触发 CA 速率限制
+  - 静态证书优先：同时配置 `cert`/`key` 时忽略 ACME 并给出告警
+- **config**: `ssl.acme` 配置校验与默认配置模板说明
+
 ## [0.4.1] - 2026-06-10
 
 ### Fixed
