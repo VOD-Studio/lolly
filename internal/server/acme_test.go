@@ -176,21 +176,52 @@ func TestRegisterACMEChallengeLocation(t *testing.T) {
 	}
 }
 
-// TestAcmeHosts 验证申请域名推导优先级委托给 config.ACMEConfig.ResolveHosts。
-func TestAcmeHosts(t *testing.T) {
-	acme := &config.ACMEConfig{Hosts: []string{"a.com"}}
-	if got := acme.ResolveHosts([]string{"b.com"}, "c.com"); len(got) != 1 || got[0] != "a.com" {
-		t.Errorf("ResolveHosts() = %v, want [a.com]", got)
+// TestListenUsesPort 验证监听地址端口判断。
+func TestListenUsesPort(t *testing.T) {
+	tests := []struct {
+		name   string
+		listen string
+		port   string
+		want   bool
+	}{
+		{name: "any addr 80", listen: ":80", port: "80", want: true},
+		{name: "explicit 80", listen: "0.0.0.0:80", port: "80", want: true},
+		{name: "ipv6 80", listen: "[::]:80", port: "80", want: true},
+		{name: "other port", listen: ":443", port: "80", want: false},
+		{name: "unix socket", listen: "unix:/tmp/x.sock", port: "80", want: false},
+		{name: "empty", listen: "", port: "80", want: false},
+		{name: "bad format", listen: "no-port", port: "80", want: false},
 	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := listenUsesPort(tt.listen, tt.port); got != tt.want {
+				t.Errorf("listenUsesPort(%q, %q) = %v, want %v", tt.listen, tt.port, got, tt.want)
+			}
+		})
+	}
+}
 
-	acme = &config.ACMEConfig{}
-	if got := acme.ResolveHosts([]string{"b.com"}, "c.com"); len(got) != 1 || got[0] != "b.com" {
-		t.Errorf("ResolveHosts() = %v, want [b.com]", got)
+// TestListensOnPort_Found 验证存在监听该端口的服务器。
+func TestListensOnPort_Found(t *testing.T) {
+	s := New(&config.Config{Servers: []config.ServerConfig{
+		{Listen: ":443"},
+		{Listen: ":80"},
+	}})
+	if !s.listensOnPort("80") {
+		t.Error("listensOnPort(80) = false, want true")
 	}
-	if got := acme.ResolveHosts(nil, "c.com"); len(got) != 1 || got[0] != "c.com" {
-		t.Errorf("ResolveHosts() = %v, want [c.com]", got)
+	if s.listensOnPort("8080") {
+		t.Error("listensOnPort(8080) = true, want false")
 	}
-	if got := acme.ResolveHosts(nil, ""); len(got) != 0 {
-		t.Errorf("ResolveHosts() = %v, want empty", got)
+}
+
+// TestWarnIfHTTP01Unreachable_NoWarnForTLSALPN 验证 tls-alpn-01 不触发告警。
+func TestWarnIfHTTP01Unreachable_NoWarnForTLSALPN(t *testing.T) {
+	srv := acmeServerConfig(t, config.ACMEChallengeTLSALPN01, "example.com")
+	s := New(&config.Config{Servers: []config.ServerConfig{srv}})
+	if err := s.initACMEManagers(); err != nil {
+		t.Fatalf("initACMEManagers() error = %v", err)
 	}
+	// tls-alpn-01 不需要 80 端口；仅验证不 panic
+	s.warnIfHTTP01Unreachable()
 }

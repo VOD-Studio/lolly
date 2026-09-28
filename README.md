@@ -52,7 +52,7 @@
 - **连接限制** - 单 IP 并发连接数限制
 - **认证** - Basic Auth，支持 bcrypt 与 argon2id；外部 auth_request 子请求
 - **安全头部** - HSTS、X-Frame-Options、CSP、Referrer-Policy
-- **SSL/TLS** - OCSP Stapling、TLS 1.2/1.3、加密套件配置、Session Tickets 密钥轮换、客户端证书验证（mTLS）
+- **SSL/TLS** - OCSP Stapling、TLS 1.2/1.3、加密套件配置、Session Tickets 密钥轮换、客户端证书验证（mTLS）、ACME 自动证书签发/续期（Let's Encrypt，支持 tls-alpn-01 / http-01 挑战）
 - **请求体限制** - 可配置全局和路径级别的请求体大小限制
 
 ### 性能优化
@@ -72,7 +72,7 @@
 - **优雅关闭** - QUIT 信号触发，等待请求完成，支持超时配置
 - **状态监控** - 内置 `/status` 端点，统计连接数、请求数、流量、上游健康状态、缓存命中率
 - **pprof 端点** - 内置性能分析端点，支持 CPU/heap/goroutine/block 分析
-- **缓存清理 API** - POST `/purge` 端点，支持按路径清理代理缓存
+- **ACME 证书监控** - 周期性扫描 ACME 状态目录，证书临近过期或已过期时输出分级告警日志；http-01 挑战缺少 80 端口监听器时启动告警
 
 ## 架构
 

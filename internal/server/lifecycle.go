@@ -67,6 +67,11 @@ func (s *Server) cleanupResources() {
 	// 停止 RateLimiter 的后台清理 goroutine
 	s.stopRateLimiters()
 
+	// 停止 ACME 证书到期监控
+	if s.certMonitor != nil {
+		s.certMonitor.Stop()
+	}
+
 	// 关闭 Lua 引擎
 	if s.luaEngine != nil {
 		s.luaEngine.Close()

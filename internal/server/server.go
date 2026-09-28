@@ -69,6 +69,7 @@ type Server struct {
 	tlsManagers         []*ssl.TLSManager
 	sniManagers         []*ssl.SNIManager
 	acmeManagers        []*ssl.ACMEManager
+	certMonitor         *ssl.CertMonitor
 	tlsManagersMu       sync.Mutex
 	accessLogMiddleware *accesslog.AccessLog
 	luaEngine           *lua.LuaEngine
@@ -309,6 +310,9 @@ func (s *Server) Start() error {
 	if err := s.initACMEManagers(); err != nil {
 		return err
 	}
+
+	// 启动 ACME 证书到期监控
+	s.startCertMonitor()
 
 	// 初始化 GoroutinePool
 	s.pool = initGoroutinePool(&s.config.Performance)

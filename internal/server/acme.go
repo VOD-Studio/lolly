@@ -20,10 +20,13 @@ package server
 
 import (
 	"fmt"
+	"net"
+	"strings"
 
 	"github.com/valyala/fasthttp"
 	"github.com/valyala/fasthttp/fasthttpadaptor"
 	"rua.plus/lolly/internal/handler"
+	"rua.plus/lolly/internal/logging"
 	"rua.plus/lolly/internal/matcher"
 	"rua.plus/lolly/internal/netutil"
 	"rua.plus/lolly/internal/ssl"
@@ -61,7 +64,92 @@ func (s *Server) initACMEManagers() error {
 	}
 
 	s.acmeManagers = managers
+	s.warnIfHTTP01Unreachable()
 	return nil
+}
+
+// startCertMonitor 启动 ACME 证书到期监控。
+//
+// 把所有启用 ACME（且未使用静态证书）的服务器状态目录交给一个监控实例，
+// 由它周期性扫描并输出到期告警。无 ACME 服务器时不启动。
+func (s *Server) startCertMonitor() {
+	var paths []string
+	for i := range s.config.Servers {
+		srv := &s.config.Servers[i]
+		if !srv.SSL.ACME.Enabled {
+			continue
+		}
+		if srv.SSL.Cert != "" && srv.SSL.Key != "" {
+			continue
+		}
+		path := srv.SSL.ACME.StatePath
+		if path == "" {
+			path = ssl.DefaultACMEStatePath
+		}
+		paths = append(paths, path)
+	}
+	if len(paths) == 0 {
+		return
+	}
+
+	s.certMonitor = ssl.NewCertMonitor(paths)
+	s.certMonitor.Start()
+}
+
+// warnIfHTTP01Unreachable 在启用 http-01 挑战但没有任何 server 监听 80 端口时告警。
+//
+// http-01 校验要求 CA 能通过 80 端口访问到挑战文件。常见配置错误是把
+// ACME 放在只有 443 的 server 上，导致签发一直失败且难以定位，因此在
+// 启动阶段主动提示。
+func (s *Server) warnIfHTTP01Unreachable() {
+	needsHTTP01 := false
+	for _, mgr := range s.acmeManagers {
+		if mgr != nil && mgr.HTTP01() {
+			needsHTTP01 = true
+			break
+		}
+	}
+	if !needsHTTP01 || s.listensOnPort("80") {
+		return
+	}
+	logging.Warn().Msg("ACME 使用 http-01 挑战，但未发现监听 80 端口的 server，CA 校验可能失败（可改用 tls-alpn-01）")
+}
+
+// listensOnPort 报告是否有 server 监听指定 TCP 端口。
+//
+// 参数：
+//   - port: 端口号字符串，如 "80"
+//
+// 返回值：
+//   - bool: 存在监听该端口的 server 时返回 true
+func (s *Server) listensOnPort(port string) bool {
+	for i := range s.config.Servers {
+		if listenUsesPort(s.config.Servers[i].Listen, port) {
+			return true
+		}
+	}
+	return false
+}
+
+// listenUsesPort 判断监听地址是否使用指定端口。
+//
+// 非 TCP 监听（Unix socket、空地址、格式非法）一律返回 false。
+//
+// 参数：
+//   - listen: 监听地址，如 ":80"、"0.0.0.0:8080"、"unix:/tmp/x.sock"
+//   - port: 端口号字符串
+//
+// 返回值：
+//   - bool: 命中时返回 true
+func listenUsesPort(listen, port string) bool {
+	if listen == "" || strings.HasPrefix(listen, "unix:") {
+		return false
+	}
+	_, p, err := net.SplitHostPort(listen)
+	if err != nil {
+		return false
+	}
+	return p == port
 }
 
 // acmeManagerAt 返回指定服务器索引对应的 ACME 管理器。

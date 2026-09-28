@@ -17,6 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - 证书状态持久化到 `state_path`，进程重启后复用，避免触发 CA 速率限制
   - 静态证书优先：同时配置 `cert`/`key` 时忽略 ACME 并给出告警
 - **config**: `ssl.acme` 配置校验与默认配置模板说明
+- **ssl**: ACME 证书到期监控，临近过期（默认 30 天）/ 已过期时输出分级告警
+- **server**: ACME http-01 挑战缺少 80 端口监听器时启动告警
 
 ## [0.4.1] - 2026-06-10
 
