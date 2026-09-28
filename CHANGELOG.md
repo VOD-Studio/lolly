@@ -7,7 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-28
+
 ### Added
+
+#### SSL/TLS
 
 - **ssl**: 内置 ACME（Let's Encrypt）自动证书签发/续期，支持 `ssl.acme` 配置块
   - 无需 certbot/acme-companion 等外部工具即可申请与续期证书
@@ -16,9 +20,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - 支持 EAB（外部账户绑定）与域名白名单（防止任意 SNI 刷证书）
   - 证书状态持久化到 `state_path`，进程重启后复用，避免触发 CA 速率限制
   - 静态证书优先：同时配置 `cert`/`key` 时忽略 ACME 并给出告警
-- **config**: `ssl.acme` 配置校验与默认配置模板说明
+- **ssl**: 实现基于 SNI 的多证书选择（SNIManager），虚拟主机可按域名选用独立证书
+- **ssl**: 实现 `ssl_reject_handshake`，对未知 SNI 直接拒绝 TLS 握手
 - **ssl**: ACME 证书到期监控，临近过期（默认 30 天）/ 已过期时输出分级告警
 - **server**: ACME http-01 挑战缺少 80 端口监听器时启动告警
+- **config**: `ssl.acme` 配置校验与默认配置模板说明
+
+#### 中间件与可观测性
+
+- **middleware/requestid**: 请求 ID 生成与透传中间件
+- **server,proxy**: Request-ID 注入中间件链并随代理请求转发
+- **middleware/cors**: CORS 中间件，支持 server 级配置
+- **accesslog**: `sample_rate` 配置，确定性采样降低访问日志 CPU 与分配开销
+- **pprof**: 新增 `/debug/pprof/allocs` 端点，支持分配画像
+- **server**: `/healthz` 与 `/readyz` 端点，适配 Kubernetes 探针
+
+#### 配置
+
+- **config**: `${ENV_VAR}` 变量插值，支持在 YAML 配置中引用环境变量
+
+### Changed
+
+- **hostmatch**: 提取 `server_name` 匹配逻辑为独立包
+- **server**: `VHostManager` 委托给 `hostmatch.Matcher`，收敛虚拟主机匹配实现
+- **ssl**: 收敛 ACME 域名解析与挑战处理器
+
+### Performance
+
+- **netutil**: 缓存 `RemoteAddr` 字符串格式化
+- **handler**: 启用文件信息缓存并修复 index 文件缓存查找
+- **static**: 默认启用 `FileInfoCache` 并支持负缓存
+- **accesslog**: `sample_rate` 降低访问日志 CPU 与分配开销
+
+### Fixed
+
+- **server**: 虚拟主机模式下按域名选择独立证书
+- **server**: 多服务器模式下追踪并关闭子 TLS 管理器，修复资源泄漏
+- **cache**: 文件缓存命中时更新 `LastAccess`，防止条目过期
+- **config,server**: `Load` 时合并默认值并修复监控注册
+- 多模块高严重度问题修复（handler/http2/loadbalance/logging/resolver/ssl、proxy/handler/server/stream/ratelimit、compression/ssl/server/lua、server/app/proxy/resolver/middleware/lua、logging/mimeutil/variable）
+  - 资源泄漏与功能缺陷
+  - 数据竞争与并发缺陷
+  - nil 守卫与安全默认值
+  - 数据损坏与行为错误
+- Stage 1 深度评审问题修复
+
+### Build
+
+- **ci**: 主分支/PR 的 fmt/lint/test/build 流水线
+- **ci**: `v*` tag 触发的 GoReleaser 多平台发布（linux/darwin/windows × amd64/arm64）
 
 ## [0.4.1] - 2026-06-10
 
