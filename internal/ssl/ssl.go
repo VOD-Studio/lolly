@@ -3,12 +3,15 @@
 // 该文件包含 TLS 配置管理的核心逻辑，包括：
 //   - 安全的 TLS 默认配置（仅 TLSv1.2 和 TLSv1.3）
 //   - 证书加载和管理
-//   - SNI（服务器名称指示）支持
 //   - OCSP Stapling 支持
+//
+// 多域名共享同一监听端口、按 SNI（服务器名称指示）选择不同证书的场景，
+// 见 sni.go 中的 SNIManager，它组合多个 TLSManager 并按 server_name
+// 规则（与 HTTP 虚拟主机路由一致）动态选择证书。
 //
 // 主要用途：
 //
-//	用于管理 HTTPS 服务器的 TLS 配置，支持多证书虚拟主机。
+//	用于管理 HTTPS 服务器的 TLS 配置。
 //
 // 安全默认值：
 //   - TLS 版本：仅启用 TLSv1.2 和 TLSv1.3
@@ -53,12 +56,10 @@ import (
 
 // TLSManager TLS 配置管理器。
 //
-// 管理单个或多个证书的 TLS 配置，支持 SNI（服务器名称指示）
-// 用于多证书虚拟主机，以及 OCSP Stapling 用于证书状态验证。
+// 管理单个证书的 TLS 配置，包括 OCSP Stapling 用于证书状态验证。
+// 多域名共享同一监听端口、按 SNI 选择不同证书的场景由
+// SNIManager（sni.go）组合多个 TLSManager 实现。
 type TLSManager struct {
-	// configs TLS 配置映射，按服务器名称索引
-	configs map[string]*tls.Config
-
 	// defaultCfg 默认配置，用于 fallback
 	defaultCfg *tls.Config
 
@@ -140,7 +141,6 @@ func NewTLSManager(cfg *config.SSLConfig) (*TLSManager, error) {
 	}
 
 	manager := &TLSManager{
-		configs:      make(map[string]*tls.Config),
 		certificates: make(map[string]*x509.Certificate),
 		issuers:      make(map[string]*x509.Certificate),
 	}
@@ -242,20 +242,11 @@ func (m *TLSManager) Close() {
 // 返回值：
 //   - *tls.Config: 带有 OCSP 响应的 TLS 配置
 //   - error: 配置错误
-func (m *TLSManager) getConfigForClientWithOCSP(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+func (m *TLSManager) getConfigForClientWithOCSP(_ *tls.ClientHelloInfo) (*tls.Config, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	// 获取基础配置
-	var baseCfg *tls.Config
-	if hello.ServerName != "" {
-		if cfg, ok := m.configs[hello.ServerName]; ok {
-			baseCfg = cfg
-		}
-	}
-	if baseCfg == nil {
-		baseCfg = m.defaultCfg
-	}
+	baseCfg := m.defaultCfg
 
 	// 无 OCSP 管理器或无证书时，返回基础配置
 	if m.ocspManager == nil || len(baseCfg.Certificates) == 0 {
