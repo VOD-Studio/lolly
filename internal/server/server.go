@@ -64,6 +64,7 @@ type Server struct {
 	resolver            resolver.Resolver
 	tlsManager          *ssl.TLSManager
 	tlsManagers         []*ssl.TLSManager
+	sniManagers         []*ssl.SNIManager
 	tlsManagersMu       sync.Mutex
 	accessLogMiddleware *accesslog.AccessLog
 	luaEngine           *lua.LuaEngine
@@ -696,6 +697,27 @@ func (s *Server) startVHostMode() error {
 
 	s.fastServer = s.createFastServer(serverCfg, s.handler)
 
+	// 按 SNI 为每个虚拟主机选择独立证书。defaultIdx 指定未匹配任何
+	// server_name 时使用哪个虚拟主机的证书作为兜底。
+	defaultIdx := -1
+	for i := range s.config.Servers {
+		if s.config.Servers[i].Default {
+			defaultIdx = i
+			break
+		}
+	}
+	sniMgr, err := ssl.BuildSNIManager(s.config.Servers, defaultIdx)
+	if err != nil {
+		return fmt.Errorf("failed to build SNI manager: %w", err)
+	}
+	if sniMgr != nil {
+		s.fastServer.TLSConfig = sniMgr.TLSConfig()
+
+		s.tlsManagersMu.Lock()
+		s.sniManagers = append(s.sniManagers, sniMgr)
+		s.tlsManagersMu.Unlock()
+	}
+
 	s.running.Store(true)
 
 	return s.startServer(serverCfg, s.fastServer)
@@ -897,6 +919,10 @@ func (s *Server) wrapHandler(base fasthttp.RequestHandler, serverCfg *config.Ser
 }
 
 // startServer 创建监听器并启动 fasthttp.Server，支持可选 TLS。
+//
+// 如果 fastSrv.TLSConfig 已经设置（例如虚拟主机模式下由 SNIManager
+// 预先配置的多证书 TLS 配置），则直接使用现有配置，不再基于
+// serverCfg.SSL 创建新的单证书 TLSManager。
 func (s *Server) startServer(serverCfg *config.ServerConfig, fastSrv *fasthttp.Server) error {
 	ln, err := s.createListener(serverCfg)
 	if err != nil {
@@ -904,12 +930,19 @@ func (s *Server) startServer(serverCfg *config.ServerConfig, fastSrv *fasthttp.S
 	}
 	s.listeners = append(s.listeners, ln)
 
-	if serverCfg.SSL.Cert != "" && serverCfg.SSL.Key != "" {
+	if fastSrv.TLSConfig == nil && serverCfg.SSL.Cert != "" && serverCfg.SSL.Key != "" {
 		tlsManager, err := ssl.NewTLSManager(&serverCfg.SSL)
 		if err != nil {
 			return fmt.Errorf("failed to create TLS manager: %w", err)
 		}
 		fastSrv.TLSConfig = tlsManager.GetTLSConfig()
+
+		s.tlsManagersMu.Lock()
+		s.tlsManagers = append(s.tlsManagers, tlsManager)
+		s.tlsManagersMu.Unlock()
+	}
+
+	if fastSrv.TLSConfig != nil {
 		return fastSrv.ServeTLS(ln, "", "")
 	}
 

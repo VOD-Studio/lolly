@@ -49,6 +49,10 @@ func (s *Server) cleanupResources() {
 		m.Close()
 	}
 	s.tlsManagers = nil
+	for _, m := range s.sniManagers {
+		m.Close()
+	}
+	s.sniManagers = nil
 	s.tlsManagersMu.Unlock()
 
 	// 关闭 AccessControl (释放 GeoIP 资源)
