@@ -78,6 +78,15 @@ type HSTSConfig struct {
 // Session Tickets 允许 TLS 1.3 会话恢复，避免完整握手，显著提升性能。
 // 密钥定期轮换增强安全性，同时保留旧密钥确保已发放的票据仍可解密。
 //
+// 与 nginx ssl_session_cache 的关系：
+// nginx 的 ssl_session_cache 是服务端维护的会话 ID 缓存（TLS 1.2 及以下
+// 的经典会话恢复机制）。Go 的 crypto/tls 服务端没有暴露等价的会话 ID
+// 缓存配置，会话恢复统一通过本配置项对应的 Session Ticket（无状态、
+// 加密票据）实现——这也是 TLS 1.3 唯一的恢复机制，且被现代 TLS 部署
+// （包括 nginx 自身）广泛采用。因此 session_tickets.enabled=true 即
+// 为 nginx ssl_session_cache 的功能等价物；设为 false 等同于同时禁用
+// session cache 和 session tickets。
+//
 // 注意事项：
 //   - KeyFile 为密钥存储文件路径，用于持久化密钥
 //   - RotateInterval 为密钥轮换间隔，建议 1-24 小时
