@@ -1,0 +1,49 @@
+# Release - 推送 v* tag 时触发发布。
+#
+# 流程：tag -> GoReleaser 自动创建 GitHub Release + 构建全平台产物 +
+# 校验和文件，全部挂到对应 Release 下。
+#
+# 触发示例：
+#   git tag v0.5.0
+#   git push origin v0.5.0
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  # GoReleaser 需要 contents:write 来创建 Release 和上传产物。
+  contents: write
+  # 如未来要发布 Homebrew tap / 讨论区公告等再按需放开。
+  # packages: write
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        # GoReleaser 生成 changelog 需要完整 git 历史。
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache: true
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          # 锁定 v2 主线，避免 v3 未来 breaking change 突然中断发布。
+          version: '~> v2'
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

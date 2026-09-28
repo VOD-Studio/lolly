@@ -1,0 +1,102 @@
+# GoReleaser 配置 - Lolly 多平台发布。
+#
+# 文档：https://goreleaser.com
+# 与 Makefile 中的 build 目标保持一致的 ldflags / 构建约束：
+#   - CGO_ENABLED=0（静态二进制，纯 Go 交叉编译）
+#   - -trimpath / -s -w（去符号、去路径）
+#   - 版本信息注入 internal/version.*
+#
+# 触发：push v* tag -> Release workflow 调用本配置。
+version: 2
+
+project_name: lolly
+
+# 构建前确保工作区干净 + 不会意外提交（CI 里 release --clean 已处理）。
+before:
+  hooks:
+    - go mod tidy
+
+# 全平台产物。CGO_ENABLED=0 下纯 Go 交叉编译，无需 C 工具链。
+builds:
+  - id: lolly
+    main: ./
+    binary: lolly
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    # 忽略不常见的组合（按需增删）：
+    ignore:
+      # Windows arm64 实际可产出，保留；如不需要可在此忽略。
+      # - goos: windows
+      #   goarch: arm64
+    ldflags:
+      - -s -w -trimpath
+      - -X rua.plus/lolly/internal/version.Version={{.Version}}
+      - -X rua.plus/lolly/internal/version.GitCommit={{.ShortCommit}}
+      - -X rua.plus/lolly/internal/version.GitBranch={{.Branch}}
+      - -X rua.plus/lolly/internal/version.BuildTime={{.Date}}
+      - -X rua.plus/lolly/internal/version.GoVersion={{.Env.GOVERSION}}
+      - -X rua.plus/lolly/internal/version.BuildPlatform={{.Os}}/{{.Arch}}
+    mod_timestamp: '{{ .CommitTimestamp }}'
+
+archives:
+  - id: default
+    builds: [lolly]
+    # 文件名：lolly_<version>_<os>_<arch>.tar.gz / .zip
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      # 附带项目文档到每个压缩包，便于开箱即用。
+      - README*.md
+      - LICENSE*
+
+# 生成 checksums.txt（SHA256），随 Release 一起发布。
+checksum:
+  name_template: 'checksums.txt'
+  algorithm: sha256
+
+# 自动生成的 changelog（按 commit 类型分组）。
+changelog:
+  use: git
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^chore:'
+      - '^ci:'
+      - Merge pull request
+      - Merge branch
+  groups:
+    - title: '🚀 Features'
+      regexp: '^.*?feat(\([^)]*\))?:'
+      order: 0
+    - title: '🐛 Bug Fixes'
+      regexp: '^.*?fix(\([^)]*\))?:'
+      order: 1
+    - title: '♻️ Refactor'
+      regexp: '^.*?refactor(\([^)]*\))?:'
+      order: 2
+    - title: '⚡ Performance'
+      regexp: '^.*?perf(\([^)]*\))?:'
+      order: 3
+    - title: 'Others'
+      order: 999
+
+# GitHub Release 元信息（GoReleaser Action 已自动创建，
+# 这里只控制 Release 名/notes 模板，可选）。
+release:
+  name_template: '{{ .ProjectName }} {{ .Version }}'
+  draft: false
+  prerelease: auto
+  # 不覆盖已有 Release 的 body。
+  replace_existing: false
