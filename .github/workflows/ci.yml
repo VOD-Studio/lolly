@@ -1,0 +1,67 @@
+# CI - 推送到主分支或提交 PR 时运行代码检查、测试和构建。
+#
+# 复用项目 Makefile 中已有的目标（fmt/lint/test/build），
+# 保证本地与 CI 跑同一套命令，避免规则分叉。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # 支持手动触发，便于排查问题。
+  workflow_dispatch:
+
+# 同一分支/PR 上新的 run 自动取消旧的，节省 Action 分钟。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Lint & Test & Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # 与 go.mod 的 go 1.26.1 对齐；'stable' 会自动取最新稳定版。
+          go-version: 'stable'
+          # setup-go 自带 module/build 缓存（按 go.sum 键控），
+          # 无需再手动挂 actions/cache。
+          cache: true
+
+      - name: Install gofumpt
+        # fmt 目标用的是 gofumpt（比 go fmt 更严格），CI 上需要安装。
+        run: go install mvdan.cc/gofumpt@latest
+
+      - name: Format check
+        run: make fmt
+
+      - name: Lint
+        # golangci-lint v2，配置见 .golangci.yml；make lint 会自行安装。
+        run: make lint
+
+      - name: Test
+        # 仅单元测试（make test = go test ./internal/...）。
+        # integration/e2e 需要 build tag + Docker，留作单独的 workflow。
+        run: make test
+
+      - name: Build
+        # 静态二进制（CGO_ENABLED=0），验证主分支可产出可用产物。
+        run: make build
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: lolly-${{ github.sha }}
+          path: bin/lolly
+          if-no-files-found: error
+          retention-days: 7
