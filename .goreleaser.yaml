@@ -47,7 +47,6 @@ builds:
 
 archives:
   - id: default
-    builds: [lolly]
     # 文件名：lolly_<version>_<os>_<arch>.tar.gz / .zip
     name_template: >-
       {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
@@ -98,5 +97,3 @@ release:
   name_template: '{{ .ProjectName }} {{ .Version }}'
   draft: false
   prerelease: auto
-  # 不覆盖已有 Release 的 body。
-  replace_existing: false
