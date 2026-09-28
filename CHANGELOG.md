@@ -69,6 +69,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - **ci**: 主分支/PR 的 fmt/lint/test/build 流水线
 - **ci**: `v*` tag 触发的 GoReleaser 多平台发布（linux/darwin/windows × amd64/arm64）
+- **ci**: `v*` tag 触发的多架构 Docker 镜像发布到 GHCR（`ghcr.io/vod-studio/lolly`，linux/amd64 + linux/arm64，按 semver 自动打标签 `0.5.0`/`0.5`/`0`/`latest`）
 
 ## [0.4.1] - 2026-06-10
 

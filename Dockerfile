@@ -16,24 +16,26 @@ ENV GOSUMDB=${GOSUMDB}
 COPY go.mod go.sum ./
 RUN go mod download
 
-# 构建参数（版本信息）
+# 构建参数（版本信息）。Go 版本与目标平台在容器内实测，避免 CI 宿主
+# 与镜像内 Go 版本不一致导致 version 信息失真。
 ARG VERSION=dev
 ARG GIT_COMMIT=unknown
 ARG GIT_BRANCH=unknown
 ARG BUILD_TIME=unknown
-ARG GO_VERSION=unknown
-ARG BUILD_PLATFORM=unknown
+# TARGETARCH 由 docker build / buildx 自动注入（多架构构建时按平台变化）。
+ARG TARGETARCH
 
 # 构建（参数与 make build 保持一致）
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build \
+RUN go_version="$(go env GOVERSION)" && \
+    CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build \
     -ldflags="-s -w \
         -X 'rua.plus/lolly/internal/version.Version=${VERSION}' \
         -X 'rua.plus/lolly/internal/version.GitCommit=${GIT_COMMIT}' \
         -X 'rua.plus/lolly/internal/version.GitBranch=${GIT_BRANCH}' \
         -X 'rua.plus/lolly/internal/version.BuildTime=${BUILD_TIME}' \
-        -X 'rua.plus/lolly/internal/version.GoVersion=${GO_VERSION}' \
-        -X 'rua.plus/lolly/internal/version.BuildPlatform=${BUILD_PLATFORM}'" \
+        -X 'rua.plus/lolly/internal/version.GoVersion=${go_version}' \
+        -X 'rua.plus/lolly/internal/version.BuildPlatform=linux/${TARGETARCH}'" \
     -gcflags="-l=4" \
     -asmflags="-l=4" \
     -trimpath \
