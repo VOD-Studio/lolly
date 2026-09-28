@@ -35,8 +35,11 @@ builds:
       # Windows arm64 实际可产出，保留；如不需要可在此忽略。
       # - goos: windows
       #   goarch: arm64
+    # -trimpath 是 go build 的 flag（不是链接器 flag），放在 flags 里。
+    flags:
+      - -trimpath
     ldflags:
-      - -s -w -trimpath
+      - -s -w
       - -X rua.plus/lolly/internal/version.Version={{.Version}}
       - -X rua.plus/lolly/internal/version.GitCommit={{.ShortCommit}}
       - -X rua.plus/lolly/internal/version.GitBranch={{.Branch}}

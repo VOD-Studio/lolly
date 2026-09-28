@@ -38,6 +38,11 @@ jobs:
           go-version: 'stable'
           cache: true
 
+      - name: Export GOVERSION
+        # goreleaser 的 ldflags 里用 {{.Env.GOVERSION}} 注入 Go 版本，
+        # 但 goreleaser 不会自动读取 `go env GOVERSION`，需在环境里显式提供。
+        run: echo "GOVERSION=$(go env GOVERSION)" >> "$GITHUB_ENV"
+
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v7
         with:
