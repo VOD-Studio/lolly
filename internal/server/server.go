@@ -811,8 +811,8 @@ func (s *Server) startMultiServerMode() error {
 			// 创建 fasthttp.Server
 			fastSrv := s.createFastServer(serverCfg, h)
 
-			// 检查 SSL 配置（静态证书或 ACME 自动证书）
-			hasTLS := (serverCfg.SSL.Cert != "" && serverCfg.SSL.Key != "") || serverCfg.SSL.ACME.Enabled
+			// 检查 SSL 配置（静态证书、ACME 自动证书或拒绝握手）
+			hasTLS := (serverCfg.SSL.Cert != "" && serverCfg.SSL.Key != "") || serverCfg.SSL.ACME.Enabled || serverCfg.SSL.RejectHandshake
 			if hasTLS {
 				tlsManager, err := ssl.NewTLSManager(&serverCfg.SSL, ssl.WithACMEManager(s.acmeManagerAt(idx)))
 				if err != nil {
@@ -966,7 +966,7 @@ func (s *Server) startServer(idx int, serverCfg *config.ServerConfig, fastSrv *f
 	}
 	s.listeners = append(s.listeners, ln)
 
-	hasTLS := (serverCfg.SSL.Cert != "" && serverCfg.SSL.Key != "") || serverCfg.SSL.ACME.Enabled
+	hasTLS := (serverCfg.SSL.Cert != "" && serverCfg.SSL.Key != "") || serverCfg.SSL.ACME.Enabled || serverCfg.SSL.RejectHandshake
 	if fastSrv.TLSConfig == nil && hasTLS {
 		tlsManager, err := ssl.NewTLSManager(&serverCfg.SSL, ssl.WithACMEManager(s.acmeManagerAt(idx)))
 		if err != nil {

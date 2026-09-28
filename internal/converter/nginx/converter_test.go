@@ -519,6 +519,39 @@ http {
 	}
 }
 
+func TestConvertSSLRejectHandshake(t *testing.T) {
+	input := `
+http {
+    server {
+        listen 443 ssl default_server;
+        ssl_reject_handshake on;
+    }
+    server {
+        listen 443 ssl;
+        server_name example.com;
+        ssl_certificate /etc/ssl/server.crt;
+        ssl_certificate_key /etc/ssl/server.key;
+    }
+}
+`
+	result, err := convertString(t, input)
+	if err != nil {
+		t.Fatalf("convert error: %v", err)
+	}
+	if len(result.Config.Servers) != 2 {
+		t.Fatalf("expected 2 servers, got %d", len(result.Config.Servers))
+	}
+
+	// default_server 在前
+	def := result.Config.Servers[0]
+	if !def.SSL.RejectHandshake {
+		t.Errorf("expected SSL.RejectHandshake = true for default_server")
+	}
+	if def.SSL.Cert != "" {
+		t.Errorf("expected no cert for reject_handshake server, got %q", def.SSL.Cert)
+	}
+}
+
 func TestConvertProxyAddXForwardedFor(t *testing.T) {
 	input := `
 http {

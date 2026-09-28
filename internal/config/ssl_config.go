@@ -18,6 +18,7 @@ import "time"
 //   - Protocols 建议使用默认值，避免使用不安全的 TLS 1.0/1.1
 //   - Ciphers 仅对 TLS 1.2 有效，TLS 1.3 有固定加密套件
 //   - 启用 OCSPStapling 可提升握手性能
+//   - RejectHandshake 与 Cert/Key/ACME 互斥，仅用于拒绝未知 SNI 握手
 //
 // 使用示例：
 //
@@ -41,7 +42,24 @@ type SSLConfig struct {
 	ACME           ACMEConfig           `yaml:"acme"`
 	HTTP2          HTTP2Config          `yaml:"http2"`
 	HSTS           HSTSConfig           `yaml:"hsts"`
-	OCSPStapling   bool                 `yaml:"ocsp_stapling"`
+	// RejectHandshake 是否拒绝 TLS 握手（对应 nginx ssl_reject_handshake）。
+	//
+	// 启用后该虚拟主机不再提供证书，而是对匹配到它的 ClientHello 直接
+	// 返回握手失败（handshake_failure），常用于 default_server 上拒绝
+	// 未知 SNI 的连接。与 Cert/Key、ACME 互斥：拒绝握手时无需证书。
+	//
+	// 典型用法（拒绝所有未匹配已知 server_name 的 SNI）：
+	//
+	//	servers:
+	//	  - default: true
+	//	    ssl:
+	//	      reject_handshake: true
+	//	  - server_names: ["example.com"]
+	//	    ssl:
+	//	      cert: "/etc/ssl/example.crt"
+	//	      key:  "/etc/ssl/example.key"
+	RejectHandshake bool `yaml:"reject_handshake"`
+	OCSPStapling    bool `yaml:"ocsp_stapling"`
 }
 
 // ACME 挑战类型常量。

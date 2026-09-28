@@ -611,6 +611,16 @@ func validateSSL(s *SSLConfig) error {
 		return fmt.Errorf("http2: %w", err)
 	}
 
+	// reject_handshake 与证书/ACME 互斥：拒绝握手时不需要提供证书，
+	// 同时配置两者属于语义矛盾，直接报错避免静默忽略其中一项
+	if s.RejectHandshake {
+		if hasTLS {
+			return errors.New("reject_handshake 不能与 cert/key 或 acme 同时配置")
+		}
+		// 拒绝握手模式下无需后续证书/协议校验
+		return nil
+	}
+
 	// 证书和私钥必须同时配置
 	if (s.Cert == "") != (s.Key == "") {
 		return errors.New("cert 和 key 必须同时配置")

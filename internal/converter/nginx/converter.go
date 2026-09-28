@@ -252,6 +252,11 @@ func convertServerBlock(d *Directive, upstreams map[string]*upstreamInfo, result
 			if len(bd.Args) > 0 {
 				baseServer.SSL.Key = bd.Args[0]
 			}
+		case "ssl_reject_handshake":
+			// nginx: ssl_reject_handshake on|off
+			if len(bd.Args) > 0 && bd.Args[0] == "on" {
+				baseServer.SSL.RejectHandshake = true
+			}
 		case gzipType:
 			parseGzip(bd, &baseServer)
 		case "gzip_types":

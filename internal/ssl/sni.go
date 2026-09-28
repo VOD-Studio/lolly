@@ -20,6 +20,13 @@ import (
 	"rua.plus/lolly/internal/hostmatch"
 )
 
+// errRejectHandshake 表示因 ssl_reject_handshake 配置而拒绝握手。
+//
+// 作为 tls.Config.GetConfigForClient 的返回错误，会使 crypto/tls
+// 向客户端发送 handshake_failure 警告并中断握手。定义在 sni.go 而非
+// ssl.go 之外，是因为 SNIManager 与 TLSManager 共用同一个错误语义。
+var errRejectHandshake = errors.New("ssl: handshake rejected by ssl_reject_handshake")
+
 // SNIEntry 表示一个虚拟主机的名称及其 SSL 配置。
 //
 // Name 支持与 server_name 一致的匹配语法：精确匹配、前缀通配
@@ -133,9 +140,10 @@ func NewSNIManager(entries []SNIEntry, defaultCfg *config.SSLConfig, opts ...SNI
 //
 // 握手时根据 ClientHelloInfo.ServerName 动态选择对应虚拟主机的
 // TLS 配置；未携带 SNI 或未匹配任何虚拟主机时，回退到默认配置
-// （或第一个虚拟主机的配置）。
+// （或第一个虚拟主机的配置）。若回退目标配置了 ssl_reject_handshake，
+// 则直接拒绝握手。
 func (m *SNIManager) TLSConfig() *tls.Config {
-	base := m.fallback()
+	base := m.fallbackConfig()
 
 	cfg := &tls.Config{
 		GetConfigForClient: m.getConfigForClient,
@@ -150,28 +158,52 @@ func (m *SNIManager) TLSConfig() *tls.Config {
 	return cfg
 }
 
-// fallback 返回未匹配任何虚拟主机时使用的兜底 TLSManager 的配置。
-func (m *SNIManager) fallback() *tls.Config {
+// fallbackManager 返回未匹配任何虚拟主机时使用的兜底 TLSManager。
+//
+// 优先使用显式配置的默认虚拟主机，其次回退到首个虚拟主机，
+// 都没有时返回 nil。
+func (m *SNIManager) fallbackManager() *TLSManager {
 	if m.defaultMgr != nil {
-		return m.defaultMgr.GetTLSConfig()
+		return m.defaultMgr
 	}
 	if len(m.managers) > 0 {
-		return m.managers[0].GetTLSConfig()
+		return m.managers[0]
+	}
+	return nil
+}
+
+// fallbackConfig 返回兜底 TLSManager 的 TLS 配置，用于初始化外层
+// tls.Config 的协议版本、ALPN 等基础参数。
+func (m *SNIManager) fallbackConfig() *tls.Config {
+	if mgr := m.fallbackManager(); mgr != nil {
+		return mgr.GetTLSConfig()
 	}
 	return nil
 }
 
 // getConfigForClient 是 tls.Config.GetConfigForClient 回调，
 // 按 ClientHelloInfo.ServerName 选择对应虚拟主机的 TLS 配置。
+//
+// 选择规则：
+//   - ServerName 匹配某个虚拟主机时使用其配置；若该虚拟主机配置了
+//     ssl_reject_handshake，则返回握手失败错误，拒绝连接
+//   - 未携带 SNI 或未匹配任何虚拟主机时回退到默认（或首个）虚拟主机；
+//     若回退目标也配置了 ssl_reject_handshake，同样拒绝握手
 func (m *SNIManager) getConfigForClient(hello *tls.ClientHelloInfo) (*tls.Config, error) {
 	if hello.ServerName != "" {
 		if mgr, ok := m.matcher.Find(hello.ServerName); ok && mgr != nil {
+			if mgr.RejectHandshake() {
+				return nil, errRejectHandshake
+			}
 			return mgr.GetTLSConfig(), nil
 		}
 	}
 
-	if cfg := m.fallback(); cfg != nil {
-		return cfg, nil
+	if mgr := m.fallbackManager(); mgr != nil {
+		if mgr.RejectHandshake() {
+			return nil, errRejectHandshake
+		}
+		return mgr.GetTLSConfig(), nil
 	}
 
 	return nil, errors.New("ssl: no TLS configuration available for SNI")
@@ -227,7 +259,10 @@ func BuildSNIManager(servers []config.ServerConfig, defaultIdx int, opts ...SNIO
 
 	for i := range servers {
 		srv := &servers[i]
-		hasTLS := (srv.SSL.Cert != "" && srv.SSL.Key != "") || srv.SSL.ACME.Enabled
+		// 具备 TLS 能力：静态证书、ACME 自动证书，或仅拒绝握手
+		// （拒绝握手的服务器没有证书，但仍需纳入 SNI 匹配以便
+		// 对未知 SNI 返回握手失败）
+		hasTLS := (srv.SSL.Cert != "" && srv.SSL.Key != "") || srv.SSL.ACME.Enabled || srv.SSL.RejectHandshake
 		if !hasTLS {
 			continue
 		}
@@ -237,6 +272,17 @@ func BuildSNIManager(servers []config.ServerConfig, defaultIdx int, opts ...SNIO
 		names := srv.ServerNames
 		if len(names) == 0 {
 			names = []string{srv.Name}
+		}
+		// 拒绝握手且未配置 server_name 的服务器仅作为默认兜底，
+		// 不注册具名 SNI 条目（避免空名污染匹配器）。它通过下方
+		// defaultIdx 分支设置为 defaultCfg，由 SNIManager 的兜底
+		// 路径返回握手失败。
+		if srv.SSL.RejectHandshake && len(names) == 1 && names[0] == "" {
+			if i == defaultIdx {
+				defaultCfg = &srv.SSL
+				defaultACME = acme
+			}
+			continue
 		}
 		for _, name := range names {
 			entries = append(entries, SNIEntry{Name: name, SSL: &srv.SSL, ACME: acme})

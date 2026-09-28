@@ -521,6 +521,7 @@ func GenerateConfigYAML(cfg *Config) ([]byte, error) {
 	buf.WriteString("    #     - ECDHE-RSA-CHACHA20-POLY1305\n")
 	buf.WriteString("    #   # 拒绝不安全套件：含 RC4、DES、3DES、CBC 的配置将报错\n")
 	fmt.Fprintf(&buf, "    #   ocsp_stapling: %v              # OCSP Stapling\n", cfg.Servers[0].SSL.OCSPStapling)
+	buf.WriteString("    #   reject_handshake: false        # 拒绝握手（ssl_reject_handshake，与 cert/key/acme 互斥）\n")
 	buf.WriteString("    #   hsts:                          # HTTP Strict Transport Security\n")
 	fmt.Fprintf(&buf, "    #     max_age: %d                  # 过期时间（秒）\n", cfg.Servers[0].SSL.HSTS.MaxAge)
 	fmt.Fprintf(&buf, "    #     include_sub_domains: %v      # 包含子域名\n", cfg.Servers[0].SSL.HSTS.IncludeSubDomains)

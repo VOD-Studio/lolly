@@ -357,6 +357,36 @@ func TestValidateSSL(t *testing.T) {
 			wantErr: true,
 			errMsg:  "未知的 TLS 版本",
 		},
+		{
+			name: "reject_handshake单独配置",
+			config: SSLConfig{
+				RejectHandshake: true,
+			},
+			wantErr: false,
+		},
+		{
+			name: "reject_handshake与证书冲突",
+			config: SSLConfig{
+				RejectHandshake: true,
+				Cert:            "/path/to/cert.pem",
+				Key:             "/path/to/key.pem",
+			},
+			wantErr: true,
+			errMsg:  "reject_handshake 不能与 cert/key 或 acme 同时配置",
+		},
+		{
+			name: "reject_handshake与ACME冲突",
+			config: SSLConfig{
+				RejectHandshake: true,
+				ACME: ACMEConfig{
+					Enabled: true,
+					Email:   "admin@example.com",
+					Hosts:   []string{"example.com"},
+				},
+			},
+			wantErr: true,
+			errMsg:  "reject_handshake 不能与 cert/key 或 acme 同时配置",
+		},
 	}
 
 	for _, tt := range tests {

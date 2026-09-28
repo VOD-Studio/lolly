@@ -84,6 +84,11 @@ type TLSManager struct {
 	// issuers 颁发者证书映射，用于 OCSP
 	issuers map[string]*x509.Certificate
 
+	// rejectHandshake 是否拒绝握手（ssl_reject_handshake）。
+	// 为 true 时不提供任何证书，对命中该管理器的 ClientHello
+	// 直接返回握手失败。仅用于 SNI 兜底或显式拒绝未知 SNI 的场景。
+	rejectHandshake bool
+
 	// mu 保护并发访问的读写锁
 	mu sync.RWMutex
 }
@@ -131,6 +136,26 @@ func NewTLSManager(cfg *config.SSLConfig, opts ...TLSManagerOption) (*TLSManager
 	}
 	for _, opt := range opts {
 		opt(manager)
+	}
+
+	// ssl_reject_handshake：该虚拟主机不提供证书，仅对命中它的 ClientHello
+	// 返回握手失败。用于 default_server 拒绝未知 SNI 的连接。
+	// 此时无需加载证书、配置 OCSP / Session Ticket 等，直接构建一个
+	// 始终返回错误的 tls.Config 即可。
+	if cfg.RejectHandshake {
+		manager.rejectHandshake = true
+		manager.defaultCfg = &tls.Config{
+			MinVersion: tls.VersionTLS12,
+			MaxVersion: tls.VersionTLS13,
+			NextProtos: []string{"h2", "http/1.1"},
+			// 单服务器模式下由该回调直接拒绝握手；虚拟主机模式下
+			// SNIManager.getConfigForClient 会根据 rejectHandshake 标志
+			// 返回错误，不会走到这里
+			GetConfigForClient: func(*tls.ClientHelloInfo) (*tls.Config, error) {
+				return nil, errRejectHandshake
+			},
+		}
+		return manager, nil
 	}
 
 	// 证书与私钥必须成对配置：只配置其中一个视为配置错误，
@@ -305,6 +330,16 @@ func (m *TLSManager) ACMEManager() *ACMEManager {
 	return m.acmeManager
 }
 
+// RejectHandshake 返回该管理器是否配置为拒绝握手。
+//
+// 用于 SNIManager 在选择证书时判断是否应对匹配到该管理器的
+// ClientHello 直接返回握手失败（ssl_reject_handshake）。
+func (m *TLSManager) RejectHandshake() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.rejectHandshake
+}
+
 // Close 停止 OCSP 管理器和 Session Ticket 管理器并释放资源。
 func (m *TLSManager) Close() {
 	if m.ocspManager != nil {
@@ -328,6 +363,11 @@ func (m *TLSManager) Close() {
 func (m *TLSManager) getConfigForClientWithOCSP(_ *tls.ClientHelloInfo) (*tls.Config, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+
+	// 拒绝握手模式：不提供证书，直接返回握手失败
+	if m.rejectHandshake {
+		return nil, errRejectHandshake
+	}
 
 	baseCfg := m.defaultCfg
 
