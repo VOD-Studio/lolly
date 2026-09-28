@@ -688,7 +688,7 @@ func validateACME(a *ACMEConfig, serverNames []string, name string) error {
 	}
 
 	// 域名来源缺失时无法申请证书
-	if len(a.Hosts) == 0 && len(serverNames) == 0 && name == "" {
+	if len(a.ResolveHosts(serverNames, name)) == 0 {
 		return errors.New("启用 ACME 时必须配置 hosts 或 server_names")
 	}
 

@@ -106,6 +106,17 @@ func TestNewACMEManager_WildcardIgnored(t *testing.T) {
 	}
 }
 
+// TestNewACMEManager_WildcardOnly 验证仅通配符域名时直接报错，避免放开限制。
+func TestNewACMEManager_WildcardOnly(t *testing.T) {
+	_, err := NewACMEManager(&config.ACMEConfig{
+		Enabled:   true,
+		StatePath: t.TempDir(),
+	}, []string{"*.example.com"})
+	if err == nil {
+		t.Fatal("NewACMEManager() error = nil, want error when only wildcards configured")
+	}
+}
+
 // TestNewACMEManager_NoWhitelist 验证无白名单时不限制域名。
 func TestNewACMEManager_NoWhitelist(t *testing.T) {
 	mgr, err := NewACMEManager(&config.ACMEConfig{

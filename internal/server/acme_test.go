@@ -176,29 +176,21 @@ func TestRegisterACMEChallengeLocation(t *testing.T) {
 	}
 }
 
-// TestAcmeHosts 验证申请域名推导优先级。
+// TestAcmeHosts 验证申请域名推导优先级委托给 config.ACMEConfig.ResolveHosts。
 func TestAcmeHosts(t *testing.T) {
-	// acme.hosts 优先
-	hosts := acmeHosts(&config.ACMEConfig{Hosts: []string{"a.com"}}, []string{"b.com"}, "c.com")
-	if len(hosts) != 1 || hosts[0] != "a.com" {
-		t.Errorf("acmeHosts() = %v, want [a.com]", hosts)
+	acme := &config.ACMEConfig{Hosts: []string{"a.com"}}
+	if got := acme.ResolveHosts([]string{"b.com"}, "c.com"); len(got) != 1 || got[0] != "a.com" {
+		t.Errorf("ResolveHosts() = %v, want [a.com]", got)
 	}
 
-	// 其次 server_names
-	hosts = acmeHosts(&config.ACMEConfig{}, []string{"b.com"}, "c.com")
-	if len(hosts) != 1 || hosts[0] != "b.com" {
-		t.Errorf("acmeHosts() = %v, want [b.com]", hosts)
+	acme = &config.ACMEConfig{}
+	if got := acme.ResolveHosts([]string{"b.com"}, "c.com"); len(got) != 1 || got[0] != "b.com" {
+		t.Errorf("ResolveHosts() = %v, want [b.com]", got)
 	}
-
-	// 最后回退到 name
-	hosts = acmeHosts(&config.ACMEConfig{}, nil, "c.com")
-	if len(hosts) != 1 || hosts[0] != "c.com" {
-		t.Errorf("acmeHosts() = %v, want [c.com]", hosts)
+	if got := acme.ResolveHosts(nil, "c.com"); len(got) != 1 || got[0] != "c.com" {
+		t.Errorf("ResolveHosts() = %v, want [c.com]", got)
 	}
-
-	// 都为空
-	hosts = acmeHosts(&config.ACMEConfig{}, nil, "")
-	if len(hosts) != 0 {
-		t.Errorf("acmeHosts() = %v, want empty", hosts)
+	if got := acme.ResolveHosts(nil, ""); len(got) != 0 {
+		t.Errorf("ResolveHosts() = %v, want empty", got)
 	}
 }

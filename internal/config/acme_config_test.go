@@ -113,6 +113,25 @@ func TestValidateACME(t *testing.T) {
 	}
 }
 
+// TestACMEConfig_ResolveHosts 验证申请域名推导优先级。
+func TestACMEConfig_ResolveHosts(t *testing.T) {
+	withHosts := &ACMEConfig{Hosts: []string{"a.com"}}
+	if got := withHosts.ResolveHosts([]string{"b.com"}, "c.com"); len(got) != 1 || got[0] != "a.com" {
+		t.Errorf("ResolveHosts() = %v, want [a.com]", got)
+	}
+
+	empty := &ACMEConfig{}
+	if got := empty.ResolveHosts([]string{"b.com"}, "c.com"); len(got) != 1 || got[0] != "b.com" {
+		t.Errorf("ResolveHosts() = %v, want [b.com]", got)
+	}
+	if got := empty.ResolveHosts(nil, "c.com"); len(got) != 1 || got[0] != "c.com" {
+		t.Errorf("ResolveHosts() = %v, want [c.com]", got)
+	}
+	if got := empty.ResolveHosts(nil, ""); len(got) != 0 {
+		t.Errorf("ResolveHosts() = %v, want empty", got)
+	}
+}
+
 // TestValidateSSL_ACMEGrantsTLS 验证 ACME 使 HTTP/2 校验通过（提供 TLS 能力）。
 func TestValidateSSL_ACMEGrantsTLS(t *testing.T) {
 	ssl := &SSLConfig{

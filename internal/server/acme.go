@@ -20,11 +20,9 @@ package server
 
 import (
 	"fmt"
-	"net/http"
 
 	"github.com/valyala/fasthttp"
 	"github.com/valyala/fasthttp/fasthttpadaptor"
-	"rua.plus/lolly/internal/config"
 	"rua.plus/lolly/internal/handler"
 	"rua.plus/lolly/internal/matcher"
 	"rua.plus/lolly/internal/netutil"
@@ -54,7 +52,7 @@ func (s *Server) initACMEManagers() error {
 			continue
 		}
 
-		hosts := acmeHosts(&srv.SSL.ACME, srv.ServerNames, srv.Name)
+		hosts := srv.SSL.ACME.ResolveHosts(srv.ServerNames, srv.Name)
 		mgr, err := ssl.NewACMEManager(&srv.SSL.ACME, hosts)
 		if err != nil {
 			return fmt.Errorf("servers[%d]: 初始化 ACME 失败: %w", i, err)
@@ -106,7 +104,7 @@ func (s *Server) acmeManagerMap() map[int]*ssl.ACMEManager {
 func (s *Server) acmeChallengeHandler() fasthttp.RequestHandler {
 	type entry struct {
 		mgr *ssl.ACMEManager
-		h   http.Handler
+		h   fasthttp.RequestHandler
 	}
 
 	var entries []entry
@@ -114,7 +112,8 @@ func (s *Server) acmeChallengeHandler() fasthttp.RequestHandler {
 		if mgr == nil || !mgr.HTTP01() {
 			continue
 		}
-		entries = append(entries, entry{mgr: mgr, h: mgr.HTTPHandler(nil)})
+		// 适配器只构造一次，避免每个请求都重新分配
+		entries = append(entries, entry{mgr: mgr, h: fasthttpadaptor.NewFastHTTPHandlerFunc(mgr.HTTPHandler(nil).ServeHTTP)})
 	}
 	if len(entries) == 0 {
 		return nil
@@ -124,7 +123,7 @@ func (s *Server) acmeChallengeHandler() fasthttp.RequestHandler {
 		host := netutil.StripPort(string(ctx.Host()))
 		for _, e := range entries {
 			if e.mgr.HasHost(host) {
-				fasthttpadaptor.NewFastHTTPHandler(e.h)(ctx)
+				e.h(ctx)
 				return
 			}
 		}
@@ -166,28 +165,4 @@ func (s *Server) registerACMEChallengeRouter(router *handler.Router) {
 		return
 	}
 	router.GET(acmeChallengePath+"{token}", h)
-}
-
-// acmeHosts 推导服务器申请证书使用的域名列表。
-//
-// 优先级与配置验证保持一致：acme.hosts 显式配置 > server_names > name。
-//
-// 参数：
-//   - acme: ACME 配置
-//   - serverNames: 服务器的 server_names 列表
-//   - name: 服务器名称
-//
-// 返回值：
-//   - []string: 域名列表，可能为空
-func acmeHosts(acme *config.ACMEConfig, serverNames []string, name string) []string {
-	if len(acme.Hosts) > 0 {
-		return acme.Hosts
-	}
-	if len(serverNames) > 0 {
-		return serverNames
-	}
-	if name != "" {
-		return []string{name}
-	}
-	return nil
 }

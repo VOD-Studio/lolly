@@ -133,8 +133,14 @@ func NewTLSManager(cfg *config.SSLConfig, opts ...TLSManagerOption) (*TLSManager
 		opt(manager)
 	}
 
-	// 判断证书来源：静态证书优先，未配置时回退到 ACME 自动证书
-	useACME := cfg.Cert == "" || cfg.Key == ""
+	// 证书与私钥必须成对配置：只配置其中一个视为配置错误，
+	// 避免静默丢弃用户提供的证书或私钥
+	if (cfg.Cert == "") != (cfg.Key == "") {
+		return nil, errors.New("certificate and key paths are required")
+	}
+
+	// 判断证书来源：静态证书优先，两者都未配置时回退到 ACME 自动证书
+	useACME := cfg.Cert == ""
 	var cert tls.Certificate
 	var err error
 
@@ -153,6 +159,9 @@ func NewTLSManager(cfg *config.SSLConfig, opts ...TLSManagerOption) (*TLSManager
 			return nil, errors.New("certificate and key paths are required")
 		}
 		if manager.acmeManager == nil {
+			// 未注入时自行创建。此处拿不到 server_names，只能使用
+			// cfg.ACME.Hosts；正常启动路径由 Server 预先按 server_names
+			// 创建并注入，因此该分支主要服务直接调用方与测试
 			acmeMgr, acmeErr := NewACMEManager(&cfg.ACME, cfg.ACME.Hosts)
 			if acmeErr != nil {
 				return nil, fmt.Errorf("failed to initialize ACME: %w", acmeErr)

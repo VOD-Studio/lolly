@@ -109,10 +109,18 @@ func NewACMEManager(cfg *config.ACMEConfig, hosts []string) (*ACMEManager, error
 	// 域名白名单：限制只为已配置域名签发证书
 	whitelist := normalizeACMEHosts(hosts)
 	if len(whitelist) == 0 {
+		// 显式配置了域名但全部被剔除（如仅通配符）时，直接报错而非放开限制，
+		// 避免退化成"为任意 SNI 签发证书"从而触发 CA 速率限制
+		if len(hosts) > 0 {
+			return nil, fmt.Errorf("acme: 配置的域名均无法用于 ACME（通配符需 DNS-01 挑战，本实现不支持）: %v", hosts)
+		}
 		logging.Warn().Msg("ACME 未配置域名白名单，将为任意 SNI 域名尝试签发证书，存在触发 CA 速率限制的风险")
 	} else {
-		mgr.HostPolicy = autocert.HostWhitelist(hostsOf(whitelist)...)
-		m.hosts = whitelist
+		mgr.HostPolicy = autocert.HostWhitelist(whitelist...)
+		m.hosts = make(map[string]bool, len(whitelist))
+		for _, h := range whitelist {
+			m.hosts[h] = true
+		}
 	}
 
 	logging.Info().
@@ -194,29 +202,28 @@ func normalizeACMEHost(host string) string {
 // 通配符域名（*.example.com）需要 DNS-01 挑战，本实现不支持，
 // 因此直接排除并给出告警，避免这些域名进入白名单后反而拦截
 // 正常子域名的签发。
-func normalizeACMEHosts(hosts []string) map[string]bool {
+//
+// 参数：
+//   - hosts: 原始域名列表
+//
+// 返回值：
+//   - []string: 规范化后的域名列表（已去重），可能为空
+func normalizeACMEHosts(hosts []string) []string {
 	if len(hosts) == 0 {
 		return nil
 	}
-	out := make(map[string]bool, len(hosts))
+	seen := make(map[string]bool, len(hosts))
+	out := make([]string, 0, len(hosts))
 	for _, raw := range hosts {
 		h := normalizeACMEHost(raw)
-		if h == "" {
+		if h == "" || seen[h] {
 			continue
 		}
 		if strings.Contains(h, "*") {
 			logging.Warn().Str("host", h).Msg("ACME 不支持通配符域名（需 DNS-01 挑战），已忽略")
 			continue
 		}
-		out[h] = true
-	}
-	return out
-}
-
-// hostsOf 将域名集合转换为切片，供 autocert.HostWhitelist 使用。
-func hostsOf(set map[string]bool) []string {
-	out := make([]string, 0, len(set))
-	for h := range set {
+		seen[h] = true
 		out = append(out, h)
 	}
 	return out

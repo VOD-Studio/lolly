@@ -120,6 +120,30 @@ type ACMEConfig struct {
 	Enabled bool `yaml:"enabled"`
 }
 
+// ResolveHosts 推导 ACME 申请证书使用的域名列表。
+//
+// 优先级：Hosts（显式配置）> serverNames > name。
+// 配置校验与运行时（Server 启动建管理器）共用该规则，避免两处逻辑漂移。
+//
+// 参数：
+//   - serverNames: 服务器的 server_names 列表
+//   - name: 服务器名称
+//
+// 返回值：
+//   - []string: 域名列表，可能为空（表示无可用域名来源）
+func (a *ACMEConfig) ResolveHosts(serverNames []string, name string) []string {
+	if len(a.Hosts) > 0 {
+		return a.Hosts
+	}
+	if len(serverNames) > 0 {
+		return serverNames
+	}
+	if name != "" {
+		return []string{name}
+	}
+	return nil
+}
+
 // HSTSConfig HTTP Strict Transport Security 配置。
 //
 // 强制浏览器使用 HTTPS 访问，防止中间人攻击和协议降级攻击。
