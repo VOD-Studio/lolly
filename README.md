@@ -15,7 +15,7 @@
 
 - **静态文件服务** - 零拷贝传输（sendfile）、文件缓存、预压缩支持、try_files 配置、ETag 和 304 Not Modified
 - **反向代理** - 请求头/响应头修改、超时控制、故障转移（next_upstream）、Location/Refresh 头改写
-- **HTTP/2** - 完整的 HTTP/2 服务器支持，包含适配器与流控
+- **HTTP/2** - 完整的 HTTP/2 服务器支持，包含适配器与流控；TLS 上经 ALPN 协商，明文端口可启用 h2c（prior knowledge 与 Upgrade 握手）
 - **HTTP/3 (QUIC)** - 基于 quic-go，支持 0-RTT 连接
 - **WebSocket** - 完整的 WebSocket 代理支持
 - **虚拟主机** - 单进程支持多域名独立配置，server_name 支持通配符和正则匹配

@@ -17,6 +17,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - 带请求体的请求禁用 `next_upstream` 重试（流不可回放）；代理缓存对流式请求跳过
   - 与 `client_max_body_size`/bodylimit 中间件联动，超限返回 413
 
+#### HTTP/2
+
+- **http2**: 实现明文 HTTP/2（h2c），`ssl.http2.enabled` + `ssl.http2.h2c_enabled`
+  - prior knowledge 接入（RFC 7540 3.4）：明文监听器嗅探 HTTP/2 连接前导，命中即走 HTTP/2
+  - 未命中的连接原样回放给 fasthttp，同一端口上 h2c 与 HTTP/1.1 共存
+  - Upgrade 握手接入（RFC 7540 3.2）：识别 `Upgrade: h2c` + `HTTP2-Settings`，
+    劫持连接写 101，被升级的请求按规范作为 HTTP/2 流 1 响应
+  - 校验不通过的升级请求退回普通 HTTP/1.1 处理；握手不计入访问日志与中间件
+  - 复用 HTTP/2→fasthttp 适配器，请求体上限、流式读取与 ALPN 路径一致
+  - h2c 连接数受 `concurrency` 约束；`max_conns_per_ip` 不适用于多路复用连接
+  - `h2c_enabled` 与 `enabled`/TLS 监听器搭配无效时启动告警
+
 ## [0.5.0] - 2026-09-28
 
 ### Added

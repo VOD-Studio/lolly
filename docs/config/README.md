@@ -129,7 +129,8 @@ docs/config/
 | nginx 功能 | Lolly 支持 |
 |-----------|-----------|
 | WebSocket 代理 | ✓ 自动协议升级 |
-| HTTP/2 | ✓ `ssl.http2.enabled` |
+| HTTP/2 | ✓ `ssl.http2.enabled`（TLS 上经 ALPN 协商） |
+| HTTP/2 明文（h2c） | ✓ `ssl.http2.h2c_enabled`（prior knowledge 与 Upgrade 握手） |
 | HTTP/3 (QUIC) | ✓ `http3.enabled` |
 | TCP/UDP Stream | ✓ `stream` 配置 |
 | URL 重写 | ✓ `rewrite` 配置 |

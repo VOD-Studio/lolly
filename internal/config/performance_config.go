@@ -15,12 +15,13 @@ import (
 // HTTP2Config HTTP/2 配置。
 //
 // HTTP/2 提供多路复用、头部压缩和服务器推送等功能，
-// 需要服务器配置 SSL/TLS 证书才能正常工作。
+// 默认需要服务器配置 SSL/TLS 证书才能正常工作。
 //
 // 注意事项：
 //   - 必须配置有效的 SSL 证书（TLS 1.2 或更高版本）
-//   - http2.enabled 仅在配置了 SSL/TLS 时生效
 //   - 客户端可以通过 ALPN 协商使用 HTTP/2 或 HTTP/1.1
+//   - 明文 HTTP/2（h2c）需 enabled 与 h2c_enabled 同时为 true，
+//     且仅在不配置证书的监听器上生效，支持 prior knowledge 与 Upgrade: h2c
 //
 // 使用示例：
 //
@@ -32,6 +33,15 @@ import (
 //	      enabled: true
 //	      max_concurrent_streams: 128
 //	      max_header_list_size: "16KB"
+//
+// # 明文监听器上的 h2c（服务间调用、内部负载均衡）
+//
+//	server:
+//	  listen: "127.0.0.1:8080"
+//	  ssl:
+//	    http2:
+//	      enabled: true
+//	      h2c_enabled: true
 type HTTP2Config struct {
 	MaxConcurrentStreams    int           `yaml:"max_concurrent_streams"`
 	MaxHeaderListSize       int           `yaml:"max_header_list_size"`

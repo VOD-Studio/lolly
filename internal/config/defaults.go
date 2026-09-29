@@ -554,7 +554,7 @@ func GenerateConfigYAML(cfg *Config) ([]byte, error) {
 	fmt.Fprintf(&buf, "    #     max_header_list_size: %d     # 最大头部列表大小（字节）\n", cfg.Servers[0].SSL.HTTP2.MaxHeaderListSize)
 	fmt.Fprintf(&buf, "    #     idle_timeout: %ds            # 空闲超时\n", int(cfg.Servers[0].SSL.HTTP2.IdleTimeout.Seconds()))
 	fmt.Fprintf(&buf, "    #     push_enabled: %v             # 是否启用 Server Push\n", cfg.Servers[0].SSL.HTTP2.PushEnabled)
-	fmt.Fprintf(&buf, "    #     h2c_enabled: %v              # 是否启用 H2C（明文 HTTP/2）\n", cfg.Servers[0].SSL.HTTP2.H2CEnabled)
+	fmt.Fprintf(&buf, "    #     h2c_enabled: %v              # 是否启用 H2C（明文 HTTP/2，需 enabled 且监听器无证书）\n", cfg.Servers[0].SSL.HTTP2.H2CEnabled)
 	fmt.Fprintf(&buf, "    #     graceful_shutdown_timeout: %ds  # HTTP/2 优雅关闭超时\n", int(cfg.Servers[0].SSL.HTTP2.GracefulShutdownTimeout.Seconds()))
 	buf.WriteString("\n")
 

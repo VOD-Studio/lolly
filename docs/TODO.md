@@ -3,5 +3,6 @@
 - [x] 让 body limit 的 0 表示 unlimited。
 - [x] 实现请求体流式反代。
 - [x] 修复 HTTP/2 集成。
+- [x] 实现 h2c（明文 HTTP/2）prior-knowledge 支持。
 - [ ] 修复 WebSocket deadline 和 X-Forwarded-Host。
 - [ ] 确定 ACME 迁移方案。

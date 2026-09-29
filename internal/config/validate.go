@@ -1103,7 +1103,8 @@ func validateRateLimit(r *RateLimitConfig) error {
 //   - error: 验证失败时返回错误信息，成功返回 nil
 //
 // 验证规则：
-//   - http2.enabled 仅在配置了 SSL 时生效（HTTP/2 over TLS）
+//   - http2.enabled 需配置 SSL（TLS 上经 ALPN 协商），或在启用
+//     h2c_enabled 后作用于明文监听器（prior knowledge）
 //   - max_concurrent_streams 必须大于 0
 //   - max_header_list_size 必须是一个有效的字节大小（如 "16KB", "1MB"）或空
 func validateHTTP2(h *HTTP2Config, hasSSL bool) error {
