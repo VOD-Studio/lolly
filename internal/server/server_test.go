@@ -434,10 +434,12 @@ func TestSetListeners(t *testing.T) {
 	listeners := []net.Listener{listener1, listener2}
 	s.SetListeners(listeners)
 
-	// 验证设置成功
-	got := s.GetListeners()
-	if len(got) != 2 {
-		t.Errorf("Expected 2 listeners, got %d", len(got))
+	// 外部提供的监听器在启动前不属于活动监听器。
+	if got := s.GetListeners(); len(got) != 0 {
+		t.Errorf("Expected no active listeners, got %d", len(got))
+	}
+	if len(s.providedListeners) != 2 {
+		t.Errorf("Expected 2 provided listeners, got %d", len(s.providedListeners))
 	}
 }
 

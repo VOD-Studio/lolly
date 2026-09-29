@@ -87,6 +87,7 @@ type Server struct {
 	fastServers         []*fasthttp.Server // 多监听器模式使用
 	proxies             []*proxy.Proxy
 	proxiesMu           sync.RWMutex
+	providedListeners   []net.Listener
 	listeners           []net.Listener
 	healthCheckers      []*proxy.HealthChecker
 	locationEngine      *matcher.LocationEngine
@@ -244,7 +245,7 @@ func (s *Server) GetListeners() []net.Listener {
 // 参数：
 //   - listeners: 要设置的监听器列表
 func (s *Server) SetListeners(listeners []net.Listener) {
-	s.listeners = listeners
+	s.providedListeners = listeners
 }
 
 // SetUpgradeManager 设置升级管理器。
@@ -380,8 +381,8 @@ func (s *Server) createListener(cfg *config.ServerConfig) (net.Listener, error) 
 		}
 	}
 
-	if len(s.listeners) > 0 {
-		if ln := s.matchInheritedListener(s.listeners, listenAddr); ln != nil {
+	if len(s.providedListeners) > 0 {
+		if ln := s.matchInheritedListener(s.providedListeners, listenAddr); ln != nil {
 			return ln, nil
 		}
 	}
@@ -759,126 +760,152 @@ func (s *Server) startVHostMode() error {
 //   - 每个服务器有独立的中间件配置
 //   - 使用 goroutine 并行启动多个服务器
 func (s *Server) startMultiServerMode() error {
-	s.fastServers = make([]*fasthttp.Server, len(s.config.Servers))
-	s.listeners = make([]net.Listener, len(s.config.Servers))
+	groups := groupServersByListen(s.config.Servers)
+	s.fastServers = make([]*fasthttp.Server, 0, len(groups))
+	s.listeners = make([]net.Listener, 0, len(groups))
 
-	for i := range s.config.Servers {
-		serverCfg := &s.config.Servers[i]
-		ln, err := s.createListener(serverCfg)
+	for _, group := range groups {
+		fastSrv, err := s.buildListenGroupServer(group)
 		if err != nil {
-			for j := range i {
-				if s.listeners[j] != nil {
-					_ = s.listeners[j].Close()
-				}
-			}
-			return fmt.Errorf("failed to listen on %s: %w", serverCfg.Listen, err)
+			s.closeActiveListeners()
+			return err
 		}
-		s.listeners[i] = ln
-	}
-
-	var wg sync.WaitGroup
-	errCh := make(chan error, len(s.config.Servers))
-
-	for i := range s.config.Servers {
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-
-			serverCfg := &s.config.Servers[idx]
-
-			router := handler.NewRouter()
-
-			s.registerMonitoringEndpoints(router, serverCfg, serverCfg.Default)
-
-			s.registerProxyRoutes(router, serverCfg)
-
-			// Lua 路由
-			s.registerLuaRoutes(router, serverCfg)
-
-			// 静态文件服务
-			s.registerStaticHandlers(router, serverCfg)
-
-			// ACME http-01 挑战路由
-			s.registerACMEChallengeRouter(router)
-
-			// 应用中间件链、连接池包装和统计追踪
-			h, err := s.wrapHandler(router.Handler(), serverCfg)
-			if err != nil {
-				errCh <- fmt.Errorf("failed to build middleware chain (server[%d]): %w", idx, err)
-				return
-			}
-
-			// 创建 fasthttp.Server
-			fastSrv := s.createFastServer(serverCfg, h)
-
-			// 检查 SSL 配置（静态证书、ACME 自动证书或拒绝握手）
-			hasTLS := (serverCfg.SSL.Cert != "" && serverCfg.SSL.Key != "") || serverCfg.SSL.ACME.Enabled || serverCfg.SSL.RejectHandshake
-			if hasTLS {
-				tlsManager, err := ssl.NewTLSManager(&serverCfg.SSL, ssl.WithACMEManager(s.acmeManagerAt(idx)))
-				if err != nil {
-					errCh <- fmt.Errorf("failed to create TLS manager (server[%d]): %w", idx, err)
-					return
-				}
-				fastSrv.TLSConfig = tlsManager.GetTLSConfig()
-
-				s.tlsManagersMu.Lock()
-				s.tlsManagers = append(s.tlsManagers, tlsManager)
-				s.tlsManagersMu.Unlock()
-			}
-
-			s.fastServers[idx] = fastSrv
-		}(i)
-	}
-
-	// 等待所有 goroutine 完成
-	wg.Wait()
-	close(errCh)
-
-	// 检查是否有错误
-	var firstErr error
-	for err := range errCh {
-		if firstErr == nil {
-			firstErr = err
+		ln, err := s.createListener(&s.config.Servers[group.indices[0]])
+		if err != nil {
+			s.closeActiveListeners()
+			return fmt.Errorf("failed to listen on %s: %w", group.listen, err)
 		}
-	}
-
-	// 如果有错误，清理已创建的监听器
-	if firstErr != nil {
-		for _, ln := range s.listeners {
-			if ln != nil {
-				_ = ln.Close()
-			}
-		}
-		return firstErr
+		s.fastServers = append(s.fastServers, fastSrv)
+		s.listeners = append(s.listeners, ln)
 	}
 
 	s.running.Store(true)
-
-	// 启动所有服务器
-	for idx, fastSrv := range s.fastServers {
-		ln := s.listeners[idx]
-		if fastSrv == nil || ln == nil {
-			continue
-		}
-
+	var wg sync.WaitGroup
+	for i := range s.fastServers {
 		wg.Add(1)
-		go func(f *fasthttp.Server, l net.Listener, i int) {
+		go func(idx int) {
 			defer wg.Done()
-			var serveErr error
-			if f.TLSConfig != nil {
-				serveErr = f.ServeTLS(l, "", "")
+			fastSrv := s.fastServers[idx]
+			ln := s.listeners[idx]
+			var err error
+			if fastSrv.TLSConfig != nil {
+				err = fastSrv.ServeTLS(ln, "", "")
 			} else {
-				serveErr = f.Serve(l)
+				err = fastSrv.Serve(ln)
 			}
-			if serveErr != nil {
-				logging.Error().Err(serveErr).Msgf("Server [%d] error while listening on %s", i, l.Addr())
+			if err != nil {
+				logging.Error().Err(err).Str("listen", groups[idx].listen).Msg("Server error while listening")
 			}
-		}(fastSrv, ln, idx)
+		}(i)
 	}
-
-	// 等待服务器停止（阻塞）
 	wg.Wait()
 	return nil
+}
+
+// listenGroup 保存共享一个监听器的服务器原始索引。
+type listenGroup struct {
+	listen  string
+	indices []int
+}
+
+// groupServersByListen 按首次出现顺序归并完全相同的监听地址。
+func groupServersByListen(servers []config.ServerConfig) []listenGroup {
+	positions := make(map[string]int)
+	groups := make([]listenGroup, 0, len(servers))
+	for i := range servers {
+		listen := servers[i].Listen
+		position, ok := positions[listen]
+		if !ok {
+			position = len(groups)
+			positions[listen] = position
+			groups = append(groups, listenGroup{listen: listen})
+		}
+		groups[position].indices = append(groups[position].indices, i)
+	}
+	return groups
+}
+
+// buildListenGroupServer 构建一个监听分组的 Host 路由和 TLS 配置。
+func (s *Server) buildListenGroupServer(group listenGroup) (*fasthttp.Server, error) {
+	vhosts := NewVHostManager()
+	defaultIndex := group.indices[0]
+	for _, idx := range group.indices {
+		if s.config.Servers[idx].Default {
+			defaultIndex = idx
+			break
+		}
+	}
+
+	for _, idx := range group.indices {
+		serverCfg := &s.config.Servers[idx]
+		router := handler.NewRouter()
+		s.registerMonitoringEndpoints(router, serverCfg, idx == defaultIndex)
+		s.registerProxyRoutes(router, serverCfg)
+		s.registerLuaRoutes(router, serverCfg)
+		s.registerStaticHandlers(router, serverCfg)
+		s.registerACMEChallengeRouter(router)
+		h, err := s.wrapHandler(router.Handler(), serverCfg)
+		if err != nil {
+			return nil, fmt.Errorf("failed to build middleware chain (server[%d]): %w", idx, err)
+		}
+		names := serverCfg.ServerNames
+		if len(names) == 0 && serverCfg.Name != "" {
+			names = []string{serverCfg.Name}
+		}
+		for _, name := range names {
+			if err := vhosts.AddHost(name, h); err != nil {
+				return nil, fmt.Errorf("add host %s: %w", name, err)
+			}
+		}
+		if idx == defaultIndex {
+			vhosts.SetDefault(h)
+		}
+	}
+
+	representative := &s.config.Servers[group.indices[0]]
+	fastSrv := s.createFastServer(representative, vhosts.Handler())
+	if !serverConfigUsesTLS(representative) {
+		return fastSrv, nil
+	}
+
+	groupConfigs := make([]config.ServerConfig, len(group.indices))
+	acmeManagers := make(map[int]*ssl.ACMEManager)
+	defaultLocalIndex := 0
+	for localIndex, originalIndex := range group.indices {
+		groupConfigs[localIndex] = s.config.Servers[originalIndex]
+		if originalIndex == defaultIndex {
+			defaultLocalIndex = localIndex
+		}
+		if manager := s.acmeManagerAt(originalIndex); manager != nil {
+			acmeManagers[localIndex] = manager
+		}
+	}
+	sniManager, err := ssl.BuildSNIManager(groupConfigs, defaultLocalIndex, ssl.WithSNIACMEManagers(acmeManagers))
+	if err != nil {
+		return nil, fmt.Errorf("failed to build SNI manager for %s: %w", group.listen, err)
+	}
+	if sniManager != nil {
+		fastSrv.TLSConfig = sniManager.TLSConfig()
+		s.tlsManagersMu.Lock()
+		s.sniManagers = append(s.sniManagers, sniManager)
+		s.tlsManagersMu.Unlock()
+	}
+	return fastSrv, nil
+}
+
+// serverConfigUsesTLS 判断监听分组是否启用 TLS。
+func serverConfigUsesTLS(serverCfg *config.ServerConfig) bool {
+	return (serverCfg.SSL.Cert != "" && serverCfg.SSL.Key != "") || serverCfg.SSL.ACME.Enabled || serverCfg.SSL.RejectHandshake
+}
+
+// closeActiveListeners 关闭启动过程中已经激活的监听器。
+func (s *Server) closeActiveListeners() {
+	for _, ln := range s.listeners {
+		if ln != nil {
+			_ = ln.Close()
+		}
+	}
+	s.listeners = nil
 }
 
 // registerMonitoringEndpoints 注册状态监控、性能分析和缓存清理端点。
