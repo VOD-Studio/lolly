@@ -165,7 +165,7 @@ servers:
 - **速率限制**：证书与账户状态持久化在 `state_path`，进程重启后复用；
   调试时可将 `directory` 改为 `https://acme-staging-v02.api.letsencrypt.org/directory`。
 - **限制**：通配符域名需要 DNS-01 挑战，当前暂不支持。
-- **多虚拟主机**：每个 `server` 可独立配置 `ssl.acme`，SNI 握手时按域名签发。
+- **多虚拟主机**：`listen` 完全相同的 `server` 共用一个监听器，HTTP 按 Host 分流，TLS 按 SNI 选择各自的静态或 ACME 证书；每个监听地址可独立指定一个 `default: true` 作为未匹配请求的兜底。同一监听地址不能混合 TLS 与明文配置。
 - **到期监控**：lolly 每 12 小时扫描 `state_path`，证书剩余天数 < 30 输出 warn、
   < 7 输出 error、已过期输出 error，便于在续期持续失败时及时发现。
 - **启动告警**：使用 `http-01` 但没有任何 `server` 监听 80 端口时启动会告警；
