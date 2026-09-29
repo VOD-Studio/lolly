@@ -91,7 +91,7 @@ func (a *App) initVariables() {
 	}
 }
 
-// logServerAddresses logs the listening addresses based on server mode.
+// logServerAddresses 按配置中的首次出现顺序记录去重后的监听地址。
 func (a *App) logServerAddresses() {
 	a.logger.LogStartup("Config loaded successfully", map[string]string{"config_path": a.cfgPath})
 
@@ -99,7 +99,7 @@ func (a *App) logServerAddresses() {
 		return
 	}
 	const listenField = "listen"
-	for listen := range uniqueListens(a.cfg.Servers) {
+	for _, listen := range uniqueListenOrder(a.cfg.Servers) {
 		a.logger.LogStartup("Listening address", map[string]string{listenField: listen})
 	}
 }

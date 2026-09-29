@@ -62,6 +62,28 @@ type ServerConfig struct {
 	ServerTokens      bool `yaml:"server_tokens"`       // false 隐藏版本号，默认 true（零值表示显示版本）
 }
 
+// UsesTLS 判断服务器是否要求监听器执行 TLS 握手。
+//
+// 返回值：
+//   - bool: 配置了静态证书、ACME 或拒绝握手时返回 true
+func (s *ServerConfig) UsesTLS() bool {
+	return (s.SSL.Cert != "" && s.SSL.Key != "") || s.SSL.ACME.Enabled || s.SSL.RejectHandshake
+}
+
+// EffectiveServerNames 返回参与 Host 和 SNI 匹配的主机名。
+//
+// 返回值：
+//   - []string: server_names，未配置时回退到非空 name
+func (s *ServerConfig) EffectiveServerNames() []string {
+	if len(s.ServerNames) > 0 {
+		return s.ServerNames
+	}
+	if s.Name != "" {
+		return []string{s.Name}
+	}
+	return nil
+}
+
 // StaticConfig 静态文件服务配置。
 //
 // 用于配置静态文件服务器的行为，包括路径匹配、根目录和索引文件。

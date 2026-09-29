@@ -336,22 +336,11 @@ func (s *Server) Start() error {
 		}
 	}
 
-	// 根据模式选择启动方式
-	mode := s.config.GetMode()
-	switch mode {
-	case config.ServerModeSingle:
-		return s.startSingleMode()
-	case config.ServerModeVHost:
-		return s.startVHostMode()
-	case config.ServerModeMultiServer:
-		return s.startMultiServerMode()
-	case config.ServerModeAuto:
-		// auto 模式下 GetMode() 会自动推断，此处为防御性处理
-		return s.startSingleMode()
-	default:
-		// 默认使用单服务器模式
+	// 单服务器保留 LocationEngine 路径，多条配置统一按 listen 分组。
+	if len(s.config.Servers) == 1 {
 		return s.startSingleMode()
 	}
+	return s.startMultiServerMode()
 }
 
 // createListener 根据配置创建监听器。
@@ -674,12 +663,7 @@ func (s *Server) startVHostMode() error {
 		}
 
 		// 注册 server_names 数组中的所有主机名
-		names := s.config.Servers[i].ServerNames
-		if len(names) == 0 {
-			// 如果未配置 server_names，使用 Name 字段
-			names = []string{s.config.Servers[i].Name}
-		}
-		for _, name := range names {
+		for _, name := range s.config.Servers[i].EffectiveServerNames() {
 			if err := vhostMgr.AddHost(name, handler); err != nil {
 				return fmt.Errorf("add host %s: %w", name, err)
 			}
@@ -748,17 +732,13 @@ func (s *Server) startVHostMode() error {
 	return s.startServer(0, serverCfg, s.fastServer)
 }
 
-// startMultiServerMode 多服务器模式启动。
+// startMultiServerMode 按监听地址分组启动多个服务器。
 //
-// 为每个配置的服务器创建独立的 fasthttp.Server 实例，
-// 每个实例监听各自的地址并运行在独立的 goroutine 中。
+// 同一 listen 的配置共享一个监听器和 fasthttp.Server，并在组内按 Host
+// 分流；不同 listen 的分组并行提供服务。
 //
 // 返回值：
-//   - error: 启动过程中遇到的第一个错误（或全部成功时返回 nil）
-//
-// 注意事项：
-//   - 每个服务器有独立的中间件配置
-//   - 使用 goroutine 并行启动多个服务器
+//   - error: 任一监听分组的启动或服务错误
 func (s *Server) startMultiServerMode() error {
 	groups := groupServersByListen(s.config.Servers)
 	s.fastServers = make([]*fasthttp.Server, 0, len(groups))
@@ -780,31 +760,53 @@ func (s *Server) startMultiServerMode() error {
 	}
 
 	s.running.Store(true)
-	var wg sync.WaitGroup
+	serve := make([]func() error, len(s.fastServers))
 	for i := range s.fastServers {
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-			fastSrv := s.fastServers[idx]
-			ln := s.listeners[idx]
-			var err error
+		fastSrv := s.fastServers[i]
+		ln := s.listeners[i]
+		serve[i] = func() error {
 			if fastSrv.TLSConfig != nil {
-				err = fastSrv.ServeTLS(ln, "", "")
-			} else {
-				err = fastSrv.Serve(ln)
+				return fastSrv.ServeTLS(ln, "", "")
 			}
-			if err != nil {
-				logging.Error().Err(err).Str("listen", groups[idx].listen).Msg("Server error while listening")
-			}
-		}(i)
+			return fastSrv.Serve(ln)
+		}
 	}
-	wg.Wait()
-	return nil
+	return serveListenGroups(serve)
 }
 
-// listenGroup 保存共享一个监听器的服务器原始索引。
+// serveListenGroups 并行运行监听分组并返回首个服务错误。
+//
+// 参数：
+//   - serve: 每个监听分组的阻塞服务函数
+//
+// 返回值：
+//   - error: 所有非 nil 服务错误的聚合，全部正常结束时为 nil
+func serveListenGroups(serve []func() error) error {
+	errCh := make(chan error, len(serve))
+	var wg sync.WaitGroup
+	for i := range serve {
+		wg.Add(1)
+		go func(run func() error) {
+			defer wg.Done()
+			if err := run(); err != nil {
+				errCh <- err
+			}
+		}(serve[i])
+	}
+	wg.Wait()
+	close(errCh)
+	var errs []error
+	for err := range errCh {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
+}
+
+// listenGroup 保存共享一个监听器的服务器配置。
 type listenGroup struct {
-	listen  string
+	// listen 是该分组共用的原始监听地址。
+	listen string
+	// indices 保留服务器在 config.Servers 中的原始索引，供 ACME 映射使用。
 	indices []int
 }
 
@@ -848,11 +850,7 @@ func (s *Server) buildListenGroupServer(group listenGroup) (*fasthttp.Server, er
 		if err != nil {
 			return nil, fmt.Errorf("failed to build middleware chain (server[%d]): %w", idx, err)
 		}
-		names := serverCfg.ServerNames
-		if len(names) == 0 && serverCfg.Name != "" {
-			names = []string{serverCfg.Name}
-		}
-		for _, name := range names {
+		for _, name := range serverCfg.EffectiveServerNames() {
 			if err := vhosts.AddHost(name, h); err != nil {
 				return nil, fmt.Errorf("add host %s: %w", name, err)
 			}
@@ -864,7 +862,7 @@ func (s *Server) buildListenGroupServer(group listenGroup) (*fasthttp.Server, er
 
 	representative := &s.config.Servers[group.indices[0]]
 	fastSrv := s.createFastServer(representative, vhosts.Handler())
-	if !serverConfigUsesTLS(representative) {
+	if !representative.UsesTLS() {
 		return fastSrv, nil
 	}
 
@@ -891,11 +889,6 @@ func (s *Server) buildListenGroupServer(group listenGroup) (*fasthttp.Server, er
 		s.tlsManagersMu.Unlock()
 	}
 	return fastSrv, nil
-}
-
-// serverConfigUsesTLS 判断监听分组是否启用 TLS。
-func serverConfigUsesTLS(serverCfg *config.ServerConfig) bool {
-	return (serverCfg.SSL.Cert != "" && serverCfg.SSL.Key != "") || serverCfg.SSL.ACME.Enabled || serverCfg.SSL.RejectHandshake
 }
 
 // closeActiveListeners 关闭启动过程中已经激活的监听器。
@@ -993,8 +986,7 @@ func (s *Server) startServer(idx int, serverCfg *config.ServerConfig, fastSrv *f
 	}
 	s.listeners = append(s.listeners, ln)
 
-	hasTLS := (serverCfg.SSL.Cert != "" && serverCfg.SSL.Key != "") || serverCfg.SSL.ACME.Enabled || serverCfg.SSL.RejectHandshake
-	if fastSrv.TLSConfig == nil && hasTLS {
+	if fastSrv.TLSConfig == nil && serverCfg.UsesTLS() {
 		tlsManager, err := ssl.NewTLSManager(&serverCfg.SSL, ssl.WithACMEManager(s.acmeManagerAt(idx)))
 		if err != nil {
 			return fmt.Errorf("failed to create TLS manager: %w", err)

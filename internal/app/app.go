@@ -263,6 +263,13 @@ func (a *App) reloadConfig() {
 	a.logger.LogStartup("Config reloaded successfully", nil)
 }
 
+// requiresFullRestart 判断新配置是否改变运行模式或实际监听地址集合。
+//
+// 参数：
+//   - newCfg: 待重载的新配置
+//
+// 返回值：
+//   - bool: 需要重新绑定监听器时返回 true
 func (a *App) requiresFullRestart(newCfg *config.Config) bool {
 	if a.cfg.GetMode() != newCfg.GetMode() {
 		return true
@@ -281,10 +288,37 @@ func (a *App) requiresFullRestart(newCfg *config.Config) bool {
 }
 
 // uniqueListens 返回配置实际需要创建的监听地址集合。
+//
+// 参数：
+//   - servers: 服务器配置列表
+//
+// 返回值：
+//   - map[string]bool: 去重后的监听地址集合
 func uniqueListens(servers []config.ServerConfig) map[string]bool {
 	listens := make(map[string]bool, len(servers))
 	for i := range servers {
 		listens[servers[i].Listen] = true
+	}
+	return listens
+}
+
+// uniqueListenOrder 返回按首次出现顺序排列的监听地址。
+//
+// 参数：
+//   - servers: 服务器配置列表
+//
+// 返回值：
+//   - []string: 去重且顺序稳定的监听地址
+func uniqueListenOrder(servers []config.ServerConfig) []string {
+	seen := make(map[string]bool, len(servers))
+	listens := make([]string, 0, len(servers))
+	for i := range servers {
+		listen := servers[i].Listen
+		if seen[listen] {
+			continue
+		}
+		seen[listen] = true
+		listens = append(listens, listen)
 	}
 	return listens
 }

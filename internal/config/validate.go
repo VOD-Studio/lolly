@@ -138,17 +138,14 @@ func validateListenGroups(servers []ServerConfig) error {
 	hostsByListen := make(map[string]map[string]int)
 	for i := range servers {
 		srv := &servers[i]
-		hasTLS := serverUsesTLS(srv)
+		hasTLS := srv.UsesTLS()
 		if seenListen[srv.Listen] && tlsByListen[srv.Listen] != hasTLS {
 			return fmt.Errorf("监听地址 %s 不能混合 TLS 和明文 server", srv.Listen)
 		}
 		seenListen[srv.Listen] = true
 		tlsByListen[srv.Listen] = hasTLS
 
-		names := srv.ServerNames
-		if len(names) == 0 && srv.Name != "" {
-			names = []string{srv.Name}
-		}
+		names := srv.EffectiveServerNames()
 		if hostsByListen[srv.Listen] == nil {
 			hostsByListen[srv.Listen] = make(map[string]int)
 		}
@@ -161,11 +158,6 @@ func validateListenGroups(servers []ServerConfig) error {
 		}
 	}
 	return nil
-}
-
-// serverUsesTLS 判断服务器是否要求监听器执行 TLS 握手。
-func serverUsesTLS(srv *ServerConfig) bool {
-	return (srv.SSL.Cert != "" && srv.SSL.Key != "") || srv.SSL.ACME.Enabled || srv.SSL.RejectHandshake
 }
 
 // ValidateEnum 验证值是否在有效枚举列表中

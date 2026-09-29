@@ -6,6 +6,7 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -26,7 +27,7 @@ func TestMultiServerModeRoutesHostsOnOneListener(t *testing.T) {
 		}
 	}
 	cfg := &config.Config{Mode: config.ServerModeMultiServer, Servers: []config.ServerConfig{
-		{Name: "a.example", ServerNames: []string{"a.example"}, Listen: "127.0.0.1:0", Default: true, Static: []config.StaticConfig{{Path: "/", Root: roots[0], Index: []string{"index.html"}}}},
+		{Name: "a.example", ServerNames: []string{"a.example"}, Listen: "127.0.0.1:0", Static: []config.StaticConfig{{Path: "/", Root: roots[0], Index: []string{"index.html"}}}},
 		{Name: "b.example", ServerNames: []string{"b.example"}, Listen: "127.0.0.1:0", Static: []config.StaticConfig{{Path: "/", Root: roots[1], Index: []string{"index.html"}}}},
 	}}
 	srv := New(cfg)
@@ -54,6 +55,37 @@ func TestMultiServerModeRoutesHostsOnOneListener(t *testing.T) {
 		if string(body) != want {
 			t.Errorf("Host %s 响应 = %q，期望 %q", host, body, want)
 		}
+	}
+}
+
+// TestStartAutoModeRoutesHostsOnOneListener 验证 auto 推断为 vhost 时仍使用统一分组启动路径。
+func TestStartAutoModeRoutesHostsOnOneListener(t *testing.T) {
+	cfg := &config.Config{Servers: []config.ServerConfig{
+		{Name: "first.example", Listen: "127.0.0.1:0"},
+		{Name: "second.example", Listen: "127.0.0.1:0"},
+	}}
+	srv := New(cfg)
+	done := make(chan error, 1)
+	go func() { done <- srv.Start() }()
+	waitForServerRunning(srv, 2*time.Second)
+	t.Cleanup(func() { _ = srv.GracefulStop(time.Second) })
+
+	if len(srv.fastServers) != 1 || srv.fastServer != nil {
+		t.Fatalf("auto 多服务器应使用分组启动，fastServers=%d fastServer=%v", len(srv.fastServers), srv.fastServer)
+	}
+}
+
+// TestServeListenGroupsReturnsError 验证任一监听分组服务失败时向调用方返回错误。
+func TestServeListenGroupsReturnsError(t *testing.T) {
+	wantFirst := errors.New("first serve failed")
+	wantSecond := errors.New("second serve failed")
+	err := serveListenGroups([]func() error{
+		func() error { return nil },
+		func() error { return wantFirst },
+		func() error { return wantSecond },
+	})
+	if !errors.Is(err, wantFirst) || !errors.Is(err, wantSecond) {
+		t.Fatalf("serveListenGroups() = %v，期望包含两个服务错误", err)
 	}
 }
 
