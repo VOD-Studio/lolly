@@ -31,22 +31,23 @@ import (
 	"rua.plus/lolly/internal/variable"
 )
 
-// validateDefaultServer 验证 servers 中最多只有一个 default: true 服务器。
+// validateDefaultServer 验证每个监听地址最多只有一个默认服务器。
 //
 // 参数：
 //   - servers: 服务器配置列表
 //
 // 返回值：
-//   - error: 超过一个 default 时返回错误信息，成功返回 nil
+//   - error: 同一监听地址存在多个默认服务器时返回错误
 func validateDefaultServer(servers []ServerConfig) error {
-	count := 0
-	for _, s := range servers {
-		if s.Default {
-			count++
+	seen := make(map[string]int)
+	for i := range servers {
+		if !servers[i].Default {
+			continue
 		}
-	}
-	if count > 1 {
-		return errors.New("只能有一个 default: true 服务器")
+		if previous, ok := seen[servers[i].Listen]; ok {
+			return fmt.Errorf("只能有一个 default: true 服务器：监听地址 %s 的 servers[%d] 和 servers[%d] 均为默认", servers[i].Listen, previous, i)
+		}
+		seen[servers[i].Listen] = i
 	}
 	return nil
 }
@@ -91,22 +92,79 @@ func validateListenConflicts(servers []ServerConfig, mode ServerMode) error {
 	if mode != ServerModeMultiServer {
 		return nil
 	}
-
-	// 使用 listen+name 组合作为唯一标识
-	// 允许相同 listen 但不同 name（虚拟主机）
-	seen := make(map[string]int)
-	for i, s := range servers {
-		if s.Listen == "" {
+	for i := range servers {
+		if servers[i].Listen == "" {
 			return fmt.Errorf("servers[%d]: multi_server 模式下每个 server 必须配置 listen 地址", i)
 		}
-		// 使用 listen + name 作为唯一键
-		key := s.Listen + "|" + s.Name
-		if idx, exists := seen[key]; exists {
-			return fmt.Errorf("监听地址冲突: servers[%d] 和 servers[%d] 都使用 %s 且 server_name 相同", idx, i, s.Listen)
+	}
+	return validateListenGroups(servers)
+}
+
+// validateModeConstraints 验证显式模式不会丢弃服务器配置。
+//
+// 参数：
+//   - cfg: 根配置
+//
+// 返回值：
+//   - error: 模式与服务器数量或监听地址不兼容时返回错误
+func validateModeConstraints(cfg *Config) error {
+	switch cfg.Mode {
+	case ServerModeSingle:
+		if len(cfg.Servers) != 1 {
+			return errors.New("single 模式必须恰好配置一个 server")
 		}
-		seen[key] = i
+	case ServerModeVHost:
+		listen := cfg.Servers[0].Listen
+		for i := 1; i < len(cfg.Servers); i++ {
+			if cfg.Servers[i].Listen != listen {
+				return errors.New("vhost 模式只能使用一个 listen 地址")
+			}
+		}
 	}
 	return nil
+}
+
+// validateListenGroups 验证同一监听地址内协议一致且主机名不重复。
+//
+// 参数：
+//   - servers: 服务器配置列表
+//
+// 返回值：
+//   - error: 监听分组不可安全复用时返回错误
+func validateListenGroups(servers []ServerConfig) error {
+	tlsByListen := make(map[string]bool)
+	seenListen := make(map[string]bool)
+	hostsByListen := make(map[string]map[string]int)
+	for i := range servers {
+		srv := &servers[i]
+		hasTLS := serverUsesTLS(srv)
+		if seenListen[srv.Listen] && tlsByListen[srv.Listen] != hasTLS {
+			return fmt.Errorf("监听地址 %s 不能混合 TLS 和明文 server", srv.Listen)
+		}
+		seenListen[srv.Listen] = true
+		tlsByListen[srv.Listen] = hasTLS
+
+		names := srv.ServerNames
+		if len(names) == 0 && srv.Name != "" {
+			names = []string{srv.Name}
+		}
+		if hostsByListen[srv.Listen] == nil {
+			hostsByListen[srv.Listen] = make(map[string]int)
+		}
+		for _, name := range names {
+			key := strings.ToLower(strings.TrimSpace(name))
+			if previous, ok := hostsByListen[srv.Listen][key]; ok {
+				return fmt.Errorf("监听地址 %s 存在重复的 server_name %q（servers[%d] 和 servers[%d]）", srv.Listen, name, previous, i)
+			}
+			hostsByListen[srv.Listen][key] = i
+		}
+	}
+	return nil
+}
+
+// serverUsesTLS 判断服务器是否要求监听器执行 TLS 握手。
+func serverUsesTLS(srv *ServerConfig) bool {
+	return (srv.SSL.Cert != "" && srv.SSL.Key != "") || srv.SSL.ACME.Enabled || srv.SSL.RejectHandshake
 }
 
 // ValidateEnum 验证值是否在有效枚举列表中

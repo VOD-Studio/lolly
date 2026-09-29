@@ -1648,10 +1648,10 @@ func TestValidateDefaultServer(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "多个默认服务器",
+			name: "同一监听多个默认服务器",
 			servers: []ServerConfig{
 				{Listen: ":8080", Default: true},
-				{Listen: ":8081", Default: true},
+				{Listen: ":8080", Default: true},
 			},
 			wantErr: true,
 			errMsg:  "只能有一个 default: true 服务器",
@@ -1746,14 +1746,13 @@ func TestValidateListenConflicts(t *testing.T) {
 			errMsg:  "multi_server 模式下每个 server 必须配置 listen 地址",
 		},
 		{
-			name: "multi_server模式监听地址冲突",
+			name: "multi_server模式允许同一监听的不同主机",
 			servers: []ServerConfig{
-				{Listen: ":8080"},
-				{Listen: ":8080"},
+				{Listen: ":8080", Name: "a.example.com"},
+				{Listen: ":8080", Name: "b.example.com"},
 			},
 			mode:    ServerModeMultiServer,
-			wantErr: true,
-			errMsg:  "监听地址冲突",
+			wantErr: false,
 		},
 	}
 
@@ -1772,6 +1771,81 @@ func TestValidateListenConflicts(t *testing.T) {
 				if err != nil {
 					t.Errorf("validateListenConflicts() 期望返回 nil，但返回错误: %v", err)
 				}
+			}
+		})
+	}
+}
+
+// TestValidateListenGroups 测试监听分组相关的跨服务器约束。
+func TestValidateListenGroups(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		cfg     *Config
+		wantErr string
+	}{
+		{
+			name: "不同监听可分别设置默认服务器",
+			cfg: &Config{Servers: []ServerConfig{
+				{Listen: ":80", Default: true},
+				{Listen: ":443", Default: true},
+			}},
+		},
+		{
+			name: "同一监听只能设置一个默认服务器",
+			cfg: &Config{Servers: []ServerConfig{
+				{Listen: ":80", Default: true},
+				{Listen: ":80", Default: true},
+			}},
+			wantErr: "只能有一个 default: true 服务器",
+		},
+		{
+			name: "同一监听拒绝重复有效主机名",
+			cfg: &Config{Servers: []ServerConfig{
+				{Listen: ":80", ServerNames: []string{"example.com"}},
+				{Listen: ":80", Name: "example.com"},
+			}},
+			wantErr: "重复的 server_name",
+		},
+		{
+			name: "不同监听允许相同主机名",
+			cfg: &Config{Servers: []ServerConfig{
+				{Listen: ":80", Name: "example.com"},
+				{Listen: ":443", Name: "example.com"},
+			}},
+		},
+		{
+			name: "同一监听拒绝混合明文和TLS",
+			cfg: &Config{Servers: []ServerConfig{
+				{Listen: ":443", Name: "plain"},
+				{Listen: ":443", Name: "secure", SSL: SSLConfig{RejectHandshake: true}},
+			}},
+			wantErr: "不能混合 TLS 和明文",
+		},
+		{
+			name: "single模式必须恰好一个服务器",
+			cfg: &Config{Mode: ServerModeSingle, Servers: []ServerConfig{
+				{Listen: ":80"}, {Listen: ":81"},
+			}},
+			wantErr: "single 模式必须恰好配置一个 server",
+		},
+		{
+			name: "vhost模式只能使用一个监听地址",
+			cfg: &Config{Mode: ServerModeVHost, Servers: []ServerConfig{
+				{Listen: ":80"}, {Listen: ":81"},
+			}},
+			wantErr: "vhost 模式只能使用一个 listen 地址",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := Validate(tt.cfg)
+			if tt.wantErr == "" && err != nil {
+				t.Fatalf("Validate() 返回意外错误: %v", err)
+			}
+			if tt.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tt.wantErr)) {
+				t.Fatalf("Validate() 错误 = %v，期望包含 %q", err, tt.wantErr)
 			}
 		})
 	}

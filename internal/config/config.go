@@ -335,12 +335,17 @@ func Validate(cfg *Config) error {
 		return err
 	}
 
-	// 验证监听地址冲突（multi_server 模式）
-	if err := validateListenConflicts(cfg.Servers, cfg.GetMode()); err != nil {
+	// 验证模式对服务器数量和监听地址的约束
+	if err := validateModeConstraints(cfg); err != nil {
 		return err
 	}
 
-	// 验证 default 服务器唯一性
+	// 验证监听分组内的协议与主机名约束
+	if err := validateListenGroups(cfg.Servers); err != nil {
+		return err
+	}
+
+	// 验证 default 服务器在各监听分组内唯一
 	if err := validateDefaultServer(cfg.Servers); err != nil {
 		return err
 	}
