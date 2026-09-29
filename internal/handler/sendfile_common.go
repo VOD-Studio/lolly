@@ -21,13 +21,40 @@ const (
 
 // getNetConn 从 fasthttp.RequestCtx 获取底层 net.Conn。
 //
+// 明文监听器启用 h2c 嗅探后，连接会被包一层"回放已嗅探字节"的包装；
+// sendfile 需要按 *net.TCPConn/*net.UnixConn 取 socket 描述符，因此先解包
+// 一层。解包接口只由该嗅探包装实现（TLS 连接走 NetConn 语义不同，不能在此
+// 解包，否则会绕过加密）。
+//
 // 参数：
 //   - ctx: fasthttp 请求上下文
 //
 // 返回值：
 //   - net.Conn: 底层网络连接，如果无法获取则返回 nil
 func getNetConn(ctx *fasthttp.RequestCtx) net.Conn {
-	return ctx.Conn()
+	return unwrapSniffedConn(ctx.Conn())
+}
+
+// unwrapSniffedConn 解包 h2c 嗅探包装，返回真正的 socket 连接。
+//
+// 参数：
+//   - conn: 请求上下文里的连接，可能是嗅探包装或 nil
+//
+// 返回值：
+//   - net.Conn: 底层连接；非包装连接与 nil 原样返回
+func unwrapSniffedConn(conn net.Conn) net.Conn {
+	if u, ok := conn.(underlyingConn); ok {
+		return u.UnderlyingConn()
+	}
+	return conn
+}
+
+// underlyingConn 是嗅探包装连接的解包接口。
+type underlyingConn interface {
+	net.Conn
+
+	// UnderlyingConn 返回被包装的原始连接。
+	UnderlyingConn() net.Conn
 }
 
 // copyFile 普通文件拷贝（fallback）。
