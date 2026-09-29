@@ -284,6 +284,27 @@ func WithHTTP2(enabled bool, maxConcurrentStreams int) SSLOption {
 	}
 }
 
+// WithH2C 在明文监听器上启用 HTTP/2（h2c，无证书）。
+//
+// enabled 与 h2c_enabled 需同时为 true 才会挂载嗅探分派；该选项刻意不设置
+// 证书，用于验证"无 SSL 时 h2c 放行"这条配置校验路径与容器内真实行为。
+//
+// 参数：
+//   - maxConcurrentStreams: 最大并发流数，0 使用服务器默认值
+//
+// 返回构建器以支持链式调用。
+func (b *ConfigBuilder) WithH2C(maxConcurrentStreams int) *ConfigBuilder {
+	if len(b.cfg.Servers) == 0 {
+		b.WithServer(":8080")
+	}
+	b.cfg.Servers[0].SSL.HTTP2 = config.HTTP2Config{
+		Enabled:              true,
+		H2CEnabled:           true,
+		MaxConcurrentStreams: maxConcurrentStreams,
+	}
+	return b
+}
+
 // WithTLSProtocols 设置 TLS 协议版本。
 func WithTLSProtocols(protocols []string) SSLOption {
 	return func(s *config.SSLConfig) {

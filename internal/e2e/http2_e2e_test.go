@@ -2,7 +2,7 @@
 
 // http2_e2e_test.go - HTTP/2 协议 E2E 测试
 //
-// 测试 lolly HTTP/2 功能：HTTPS 连接、协议协商等。
+// 测试 lolly HTTP/2 功能：HTTPS 连接、ALPN 协议协商、明文 h2c 嗅探分派等。
 //
 // 作者：xfy
 package e2e
@@ -12,6 +12,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/net/http2"
 
 	"rua.plus/lolly/internal/e2e/testutil"
 )
@@ -304,4 +306,75 @@ func TestE2EALPNNegotiation(t *testing.T) {
 	defer resp.Body.Close()
 
 	t.Logf("HTTPS response status: %d, protocol: %s", resp.StatusCode, resp.Proto)
+}
+
+// TestE2EH2CPriorKnowledge 测试明文 HTTP/2（h2c）prior knowledge 接入。
+//
+// 容器内验证完整链路：YAML 加载 → "无 SSL 时 h2c_enabled 放行 enabled" 的
+// 配置校验 → 明文监听器嗅探分派。同一端口上 prior-knowledge 客户端得到
+// HTTP/2，普通请求仍按 HTTP/1.1 服务。
+func TestE2EH2CPriorKnowledge(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), testutil.DefaultTestTimeout)
+	defer cancel()
+
+	if !testutil.LollyImageAvailable(ctx) {
+		t.Skip("lolly:latest image not available, run 'make docker-build' first")
+	}
+
+	// 明文监听器（无证书）+ h2c 静态站点。
+	cfg := testutil.NewConfigBuilder().
+		WithServer(":8080").
+		WithStatic("/", "/var/www/html", testutil.WithIndex([]string{"index.html"})).
+		WithH2C(20)
+
+	configYAML, err := cfg.Build()
+	require.NoError(t, err, "Failed to build config")
+
+	lolly, err := testutil.StartLolly(ctx, testutil.WithConfigYAML(configYAML))
+	require.NoError(t, err, "Failed to start lolly")
+	defer lolly.Terminate(ctx)
+
+	// wait.ForLog 命中"Starting HTTP server"时端口尚未绑定完成，
+	// 需再轮询到 HTTP 可达，否则首批请求会被转发器 reset。
+	require.NoError(t, lolly.WaitForHealthy(ctx, 15*time.Second), "lolly not reachable")
+
+	// prior knowledge：http2.Transport + AllowHTTP，等价 curl --http2-prior-knowledge。
+	t.Run("prior-knowledge 连接走 HTTP/2", func(t *testing.T) {
+		h2Client := &http.Client{
+			Timeout: 10 * time.Second,
+			Transport: &http2.Transport{
+				AllowHTTP: true,
+				DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+					return (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, network, addr)
+				},
+			},
+		}
+
+		resp, err := h2Client.Get(lolly.HTTPBaseURL())
+		require.NoError(t, err, "h2c request failed")
+		defer resp.Body.Close()
+
+		body, err := io.ReadAll(resp.Body)
+		require.NoError(t, err, "Failed to read h2c body")
+
+		assert.Equal(t, 2, resp.ProtoMajor, "prior-knowledge 连接应协商为 HTTP/2")
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Contains(t, string(body), "It works")
+	})
+
+	// 同一监听器上的普通请求不得被嗅探分派影响。
+	t.Run("同端口仍服务 HTTP/1.1", func(t *testing.T) {
+		client := &http.Client{Timeout: 10 * time.Second}
+		resp, err := client.Get(lolly.HTTPBaseURL())
+		require.NoError(t, err, "HTTP/1.1 request failed")
+		defer resp.Body.Close()
+
+		body, err := io.ReadAll(resp.Body)
+		require.NoError(t, err, "Failed to read HTTP/1.1 body")
+
+		assert.Equal(t, 1, resp.ProtoMajor, "普通请求应仍按 HTTP/1.1 服务")
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Contains(t, string(body), "It works")
+	})
 }
