@@ -36,7 +36,6 @@ func (a *App) Run() int {
 	a.initServer()
 	a.initStreamServers()
 	a.initHTTP3()
-	a.initHTTP2()
 
 	a.upgradeMgr = server.NewUpgradeManager(a.srv)
 	a.srv.SetUpgradeManager(a.upgradeMgr)
@@ -124,7 +123,6 @@ func (a *App) handleSignal(sig os.Signal) bool {
 		}
 		a.logger.LogSignal("SIGQUIT", fmt.Sprintf("Graceful stop (waiting %v)", timeout))
 		a.shutdownStream()
-		a.shutdownHTTP2()
 		a.shutdownHTTP3()
 		_ = a.srv.GracefulStop(timeout)
 		return false
@@ -141,7 +139,6 @@ func (a *App) handleSignal(sig os.Signal) bool {
 			a.logger.LogSignal(sigName(sigTyped), "Stopping server")
 		}
 		a.shutdownStream()
-		a.shutdownHTTP2()
 		a.shutdownHTTP3()
 		_ = a.srv.StopWithTimeout(timeout)
 		return false
@@ -233,27 +230,24 @@ func (a *App) reloadConfig() {
 	}
 
 	oldSrv := a.srv
-	oldHTTP2 := a.http2Srv
 	oldHTTP3 := a.http3Srv
 
 	a.srv = newSrv
 	a.cfg = newCfg
 	a.logger = logging.NewAppLogger(&newCfg.Logging)
-	a.http2Srv = nil
 	a.http3Srv = nil
 
 	a.initVariables()
-	a.initHTTP2()
 	a.initHTTP3()
 
 	if a.upgradeMgr != nil {
 		a.upgradeMgr.SetListeners(newSrv.GetListeners())
 	}
 
+	// HTTP/2 由新 server.Start 内部经 fasthttp.NextProto("h2", ...) 挂载，
+	// 旧 server 的 HTTP/2 连接随 fasthttp.GracefulStop 一并关闭，
+	// 无需在 App 层维护独立的 HTTP/2 关闭路径。
 	go func() {
-		if oldHTTP2 != nil {
-			_ = oldHTTP2.Stop()
-		}
 		if oldHTTP3 != nil {
 			_ = oldHTTP3.Stop()
 		}
@@ -356,7 +350,6 @@ func (a *App) gracefulUpgrade() {
 		timeout = 30 * time.Second
 	}
 	a.shutdownStream()
-	a.shutdownHTTP2()
 	a.shutdownHTTP3()
 	_ = a.srv.GracefulStop(timeout)
 }

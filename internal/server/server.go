@@ -34,10 +34,12 @@ import (
 	"rua.plus/lolly/internal/cache"
 	"rua.plus/lolly/internal/config"
 	"rua.plus/lolly/internal/handler"
+	"rua.plus/lolly/internal/http2"
 	"rua.plus/lolly/internal/logging"
 	"rua.plus/lolly/internal/lua"
 	"rua.plus/lolly/internal/matcher"
 	"rua.plus/lolly/internal/middleware/accesslog"
+	"rua.plus/lolly/internal/middleware/bodylimit"
 	"rua.plus/lolly/internal/middleware/security"
 	"rua.plus/lolly/internal/mimeutil"
 	"rua.plus/lolly/internal/proxy"
@@ -843,6 +845,19 @@ func (s *Server) buildListenGroupServer(group listenGroup) (*fasthttp.Server, er
 		s.sniManagers = append(s.sniManagers, sniManager)
 		s.tlsManagersMu.Unlock()
 	}
+
+	// HTTP/2 是连接级协议：同一监听分组内任一虚拟主机启用 h2 即在
+	// 该分组的 fasthttp.Server 上挂载 ALPN "h2" 分派。连接协商出 h2
+	// 后，请求按 Host 头由 vhosts 分发，与 HTTP/1.1 路由一致。
+	// ponytail: HTTP/2 服务器参数取分组内首个启用 h2 的虚拟主机配置；
+	// 不同虚拟主机的 h2 参数差异在连接级不感知，需要时按 vhost 细分。
+	for _, idx := range group.indices {
+		if s.config.Servers[idx].SSL.HTTP2.Enabled {
+			s.attachHTTP2(fastSrv, &s.config.Servers[idx], vhosts.Handler())
+			break
+		}
+	}
+
 	return fastSrv, nil
 }
 
@@ -953,6 +968,10 @@ func (s *Server) startServer(idx int, serverCfg *config.ServerConfig, fastSrv *f
 		s.tlsManagersMu.Unlock()
 	}
 
+	// HTTP/2 经 ALPN 分派挂载到 fasthttp.Server，复用其监听器与连接
+	// 生命周期，避免与 fasthttp 抢占同一监听器的 Accept 循环。
+	s.attachHTTP2(fastSrv, serverCfg, s.handler)
+
 	if fastSrv.TLSConfig != nil {
 		return fastSrv.ServeTLS(ln, "", "")
 	}
@@ -963,4 +982,33 @@ func (s *Server) startServer(idx int, serverCfg *config.ServerConfig, fastSrv *f
 // SetResolver 设置 DNS 解析器。
 func (s *Server) SetResolver(r resolver.Resolver) {
 	s.resolver = r
+}
+
+// attachHTTP2 在 fasthttp.Server 上挂载 HTTP/2 ALPN 分派。
+//
+// 仅在 serverCfg.SSL.HTTP2.Enabled 且 fastSrv 已配置 TLS 时生效：
+//   - 从 serverCfg.ClientMaxBodySize 解析请求体上限（未配置时使用默认值）；
+//   - 任一代理启用请求体流式时，h2 适配器同步开启流式读取；
+//   - 调用 http2.Attach 注册 "h2" NextProto 处理器。
+//
+// 参数：
+//   - fastSrv: 目标 fasthttp.Server（需已设置 TLSConfig）
+//   - serverCfg: 该分组代表虚拟主机的配置
+//   - handler: 该分组的 fasthttp 请求处理器
+func (s *Server) attachHTTP2(fastSrv *fasthttp.Server, serverCfg *config.ServerConfig, handler fasthttp.RequestHandler) {
+	if fastSrv == nil || fastSrv.TLSConfig == nil || serverCfg == nil || !serverCfg.SSL.HTTP2.Enabled || handler == nil {
+		return
+	}
+
+	h2cfg := &serverCfg.SSL.HTTP2
+	if h2cfg.MaxBodySize <= 0 {
+		if size, err := bodylimit.ParseSize(serverCfg.ClientMaxBodySize); err == nil {
+			h2cfg.MaxBodySize = size
+		} else {
+			h2cfg.MaxBodySize = bodylimit.DefaultMaxBodySize
+		}
+	}
+	h2cfg.StreamRequestBody = config.AnyProxyRequestStreaming(s.config.Servers)
+
+	http2.Attach(fastSrv, h2cfg, handler)
 }

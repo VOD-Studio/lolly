@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"rua.plus/lolly/internal/config"
-	"rua.plus/lolly/internal/http2"
 	"rua.plus/lolly/internal/http3"
 	"rua.plus/lolly/internal/logging"
 	"rua.plus/lolly/internal/middleware/bodylimit"
@@ -24,12 +23,15 @@ import (
 )
 
 // App manages the server lifecycle, including HTTP, HTTP/3, Stream servers and graceful upgrades.
+//
+// HTTP/2 不在此层管理：它经 fasthttp.Server.NextProto("h2", ...) 挂载到
+// ALPN 分派，与 fasthttp 共享监听器与连接生命周期，由 server.Server.Start
+// 在构建每个启用 ssl.http2.enabled 的监听分组时注册。
 type App struct {
 	resv       resolver.Resolver
 	cfg        *config.Config
 	srv        *server.Server
 	http3Srv   *http3.Server
-	http2Srv   *http2.Server
 	streamSrv  *stream.Server
 	upgradeMgr *server.UpgradeManager
 	logger     *logging.AppLogger
@@ -205,59 +207,11 @@ func (a *App) initHTTP3() {
 	}()
 }
 
-// initHTTP2 starts the HTTP/2 server if enabled.
-func (a *App) initHTTP2() {
-	if len(a.cfg.Servers) == 0 || !a.cfg.Servers[0].SSL.HTTP2.Enabled || a.cfg.Servers[0].SSL.Cert == "" {
-		return
-	}
-
-	tlsConfig, err := a.srv.GetTLSConfig()
-	if err != nil {
-		a.logger.Error().Err(err).Msg("Failed to get TLS config, skipping HTTP/2")
-		return
-	}
-
-	a.cfg.Servers[0].SSL.HTTP2.MaxBodySize = a.clientMaxBodySize()
-	a.cfg.Servers[0].SSL.HTTP2.StreamRequestBody = config.AnyProxyRequestStreaming(a.cfg.Servers)
-
-	a.http2Srv, err = http2.NewServer(&a.cfg.Servers[0].SSL.HTTP2, a.srv.GetHandler(), tlsConfig)
-	if err != nil {
-		a.logger.Error().Err(err).Msg("Failed to create HTTP/2 server")
-		return
-	}
-
-	go func() {
-		a.logger.LogStartup("Starting HTTP/2 server", map[string]string{
-			"listen":                 a.cfg.Servers[0].Listen,
-			"max_concurrent_streams": fmt.Sprintf("%d", a.cfg.Servers[0].SSL.HTTP2.MaxConcurrentStreams),
-			"push_enabled":           fmt.Sprintf("%t", a.cfg.Servers[0].SSL.HTTP2.PushEnabled),
-		})
-		// HTTP/2 shares the main server's listener; ALPN negotiates protocol selection.
-		listeners := a.srv.GetListeners()
-		if len(listeners) > 0 {
-			if err := a.http2Srv.Serve(listeners[0]); err != nil {
-				a.logger.Error().Err(err).Msg("HTTP/2 server failed to start")
-			}
-		} else {
-			a.logger.Error().Msg("HTTP/2 server failed to start: no available listeners")
-		}
-	}()
-}
-
 // shutdownHTTP3 gracefully stops the HTTP/3 server.
 func (a *App) shutdownHTTP3() {
 	if a.http3Srv != nil {
 		if err := a.http3Srv.Stop(); err != nil {
 			a.logger.Error().Err(err).Msg("Failed to shutdown HTTP/3 server")
-		}
-	}
-}
-
-// shutdownHTTP2 gracefully stops the HTTP/2 server.
-func (a *App) shutdownHTTP2() {
-	if a.http2Srv != nil {
-		if err := a.http2Srv.Stop(); err != nil {
-			a.logger.Error().Err(err).Msg("Failed to shutdown HTTP/2 server")
 		}
 	}
 }

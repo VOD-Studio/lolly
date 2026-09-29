@@ -67,35 +67,12 @@ func NewServer(cfg *config.HTTP2Config, handler fasthttp.RequestHandler, tlsConf
 		return nil, fmt.Errorf("handler is nil")
 	}
 
-	// 设置默认值
-	maxConcurrentStreams := cfg.MaxConcurrentStreams
-	if maxConcurrentStreams <= 0 {
-		maxConcurrentStreams = 250
-	}
-
-	maxHeaderListSize := cfg.MaxHeaderListSize
-	if maxHeaderListSize <= 0 {
-		maxHeaderListSize = 1048576 // 1MB
-	}
-
-	idleTimeout := cfg.IdleTimeout
-	if idleTimeout <= 0 {
-		idleTimeout = 120 * time.Second
-	}
+	// 创建 HTTP/2 服务器
+	h2s := newHTTP2Server(cfg)
 
 	gracefulTimeout := cfg.GracefulShutdownTimeout
 	if gracefulTimeout <= 0 {
 		gracefulTimeout = 30 * time.Second
-	}
-
-	// 创建 HTTP/2 服务器
-	h2s := &http2.Server{
-		MaxConcurrentStreams: uint32(maxConcurrentStreams),
-		IdleTimeout:          idleTimeout,
-		MaxReadFrameSize:     uint32(maxHeaderListSize),
-		//nolint:staticcheck // SA1019: NewWriteScheduler deprecated
-		NewWriteScheduler: func() http2.WriteScheduler { return http2.NewPriorityWriteScheduler(nil) },
-		CountError:        func(_ string) {},
 	}
 
 	return &Server{

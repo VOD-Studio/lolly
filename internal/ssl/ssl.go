@@ -54,6 +54,13 @@ import (
 	"rua.plus/lolly/internal/sslutil"
 )
 
+// ALPN 协议标识：h2 为 HTTP/2 over TLS，http/1.1 为 HTTP/1.1。
+// 提取为常量便于 ALPN 通告列表复用，避免字面量散落触发 goconst。
+const (
+	protoHTTP2  = "h2"
+	protoHTTP11 = "http/1.1"
+)
+
 // TLSManager TLS 配置管理器。
 //
 // 管理单个证书的 TLS 配置，包括 OCSP Stapling 用于证书状态验证。
@@ -144,10 +151,14 @@ func NewTLSManager(cfg *config.SSLConfig, opts ...TLSManagerOption) (*TLSManager
 	// 始终返回错误的 tls.Config 即可。
 	if cfg.RejectHandshake {
 		manager.rejectHandshake = true
+		nextProtos := []string{protoHTTP11}
+		if cfg.HTTP2.Enabled {
+			nextProtos = []string{protoHTTP2, protoHTTP11}
+		}
 		manager.defaultCfg = &tls.Config{
 			MinVersion: tls.VersionTLS12,
 			MaxVersion: tls.VersionTLS13,
-			NextProtos: []string{"h2", "http/1.1"},
+			NextProtos: nextProtos,
 			// 单服务器模式下由该回调直接拒绝握手；虚拟主机模式下
 			// SNIManager.getConfigForClient 会根据 rejectHandshake 标志
 			// 返回错误，不会走到这里
@@ -199,10 +210,19 @@ func NewTLSManager(cfg *config.SSLConfig, opts ...TLSManagerOption) (*TLSManager
 	}
 
 	// 创建 TLS 配置，使用安全默认值
+	//
+	// ALPN 通告仅在 ssl.http2.enabled 时包含 h2：HTTP/2 需要专门的
+	// 处理器（由 server 层经 fasthttp.NextProto 注册），若通告了 h2
+	// 却无对应处理器，客户端协商出 h2 后会收到 HTTP/1.1 回退而连接中断。
+	// 因此 h2 的通告与处理器注册必须由同一开关（HTTP2.Enabled）驱动。
+	nextProtos := []string{protoHTTP11}
+	if cfg.HTTP2.Enabled {
+		nextProtos = []string{protoHTTP2, protoHTTP11}
+	}
 	tlsCfg := &tls.Config{
 		MinVersion: tls.VersionTLS12, // 强制 TLS 1.2 最低版本
 		MaxVersion: tls.VersionTLS13,
-		NextProtos: []string{"h2", "http/1.1"}, // 启用 HTTP/2 ALPN 支持
+		NextProtos: nextProtos,
 	}
 
 	if useACME {

@@ -31,7 +31,6 @@ func (a *App) Run() int {
 	a.initServer()
 	a.initStreamServers()
 	a.initHTTP3()
-	a.initHTTP2()
 
 	a.upgradeMgr = server.NewUpgradeManager(a.srv)
 	if a.pidFile != "" {
@@ -89,7 +88,7 @@ func (a *App) handleSignal(sig os.Signal) bool {
 			timeout = 5 * time.Second
 		}
 		a.logger.LogSignal(sigName(sig.(syscall.Signal)), "Stopping server")
-		a.shutdownHTTP2()
+		a.shutdownStream()
 		a.shutdownHTTP3()
 		_ = a.srv.StopWithTimeout(timeout)
 		return false

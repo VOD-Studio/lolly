@@ -911,21 +911,6 @@ func TestInitHTTP3_EmptyServers(t *testing.T) {
 	}
 }
 
-// TestInitHTTP2_EmptyServers 验证空服务器配置时 HTTP/2 初始化直接跳过。
-func TestInitHTTP2_EmptyServers(t *testing.T) {
-	app := &App{
-		cfg:    &config.Config{Servers: []config.ServerConfig{}},
-		logger: logging.NewAppLogger(nil),
-	}
-
-	// 不应 panic
-	app.initHTTP2()
-
-	if app.http2Srv != nil {
-		t.Error("http2Srv should remain nil when no servers are configured")
-	}
-}
-
 func waitForAppServerRunning(app *App, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
