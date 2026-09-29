@@ -124,6 +124,8 @@ type Proxy struct {
 	requestStreaming bool                            // 请求体流式转发（buffering.request_mode: off）
 	cacheIgnoreSet   map[string]bool                 // 缓存时忽略的响应头集合
 	refreshGroup     singleflight.Group              // 合并并发后台缓存刷新
+	closeOnce        sync.Once                       // 保证生命周期资源仅关闭一次
+	dnsWG            sync.WaitGroup                  // 等待 DNS 刷新协程退出
 }
 
 // NewProxy 使用给定的配置和后台目标创建一个新的反向代理实例。

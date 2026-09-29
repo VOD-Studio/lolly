@@ -26,17 +26,32 @@ func (s *Server) cleanupResources() {
 
 // cleanupResourcesOnce 执行一次服务器资源释放，保证启动失败后仍可安全调用 Stop。
 func (s *Server) cleanupResourcesOnce() {
+	if s.containerDiscoveryCancel != nil {
+		s.containerDiscoveryCancel()
+		s.containerDiscoveryWG.Wait()
+	}
+
 	// 停止 Goroutine 池
 	if s.pool != nil {
 		s.pool.Stop()
 	}
 
-	// 停止健康检查器
+	// 停止健康检查器和静态代理连接池
 	s.proxiesMu.Lock()
 	for _, hc := range s.healthCheckers {
 		hc.Stop()
 	}
+	for _, p := range s.proxies {
+		p.Close()
+	}
 	s.proxiesMu.Unlock()
+
+	// 动态代理不进入静态代理列表，由路由表统一关闭。
+	s.containerRoutersMu.Lock()
+	for _, router := range s.containerRouters {
+		router.table.Load().close()
+	}
+	s.containerRoutersMu.Unlock()
 
 	// 关闭访问日志
 	if s.accessLogMiddleware != nil {

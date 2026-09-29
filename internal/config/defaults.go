@@ -235,6 +235,18 @@ func DefaultConfig() *Config {
 			FastTimeout:     5 * time.Second,
 			ReloadTimeout:   5 * time.Second,
 		},
+		ContainerDiscovery: ContainerDiscoveryConfig{
+			Enabled:        false,
+			Endpoint:       "unix:///var/run/docker.sock",
+			ResyncInterval: 30 * time.Second,
+			Debounce:       200 * time.Millisecond,
+			RequestTimeout: 5 * time.Second,
+			ACME: ContainerDiscoveryACMEConfig{
+				Directory: DefaultACMEDirectory,
+				StatePath: "/var/lib/lolly/acme",
+				Challenge: ACMEChallengeTLSALPN01,
+			},
+		},
 	}
 }
 
@@ -268,6 +280,25 @@ func GenerateConfigYAML(cfg *Config) ([]byte, error) {
 	buf.WriteString("# vhost: 虚拟主机模式（多个 server 共享相同监听地址）\n")
 	buf.WriteString("# multi_server: 多服务器模式（多个 server 监听不同地址）\n")
 	buf.WriteString("\n")
+
+	// container_discovery 配置
+	buf.WriteString("# 容器发现配置（默认禁用）\n")
+	buf.WriteString("container_discovery:\n")
+	fmt.Fprintf(&buf, "  enabled: %v                       # 是否根据容器元数据动态创建虚拟主机\n", cfg.ContainerDiscovery.Enabled)
+	fmt.Fprintf(&buf, "  endpoint: \"%s\"  # 容器运行时 Unix socket\n", cfg.ContainerDiscovery.Endpoint)
+	buf.WriteString("  network: \"\"                        # 仅发现此容器网络，启用时必填\n")
+	buf.WriteString("  http_server: \"\"                    # 明文服务器模板的唯一 name\n")
+	buf.WriteString("  https_server: \"\"                   # TLS 服务器模板的唯一 name\n")
+	fmt.Fprintf(&buf, "  resync_interval: %s             # 全量同步间隔，0 使用默认 30s\n", cfg.ContainerDiscovery.ResyncInterval)
+	fmt.Fprintf(&buf, "  debounce: %s                    # 容器事件防抖时间\n", cfg.ContainerDiscovery.Debounce)
+	fmt.Fprintf(&buf, "  request_timeout: %s             # 容器列表和详情 API 超时\n", cfg.ContainerDiscovery.RequestTimeout)
+	fmt.Fprintf(&buf, "  required: %v                      # 初始化失败时是否阻止启动\n", cfg.ContainerDiscovery.Required)
+	buf.WriteString("  acme:                              # 动态域名证书账户参数\n")
+	buf.WriteString("    email: \"\"                       # ACME 联系邮箱\n")
+	fmt.Fprintf(&buf, "    directory: \"%s\"\n", cfg.ContainerDiscovery.ACME.Directory)
+	fmt.Fprintf(&buf, "    state_path: \"%s\"\n", cfg.ContainerDiscovery.ACME.StatePath)
+	fmt.Fprintf(&buf, "    challenge: \"%s\"              # tls-alpn-01 或 http-01\n", cfg.ContainerDiscovery.ACME.Challenge)
+	buf.WriteString("# HTTPS 模板使用 ACME 时必须设置 ssl.acme.allow_dynamic_hosts: true\n\n")
 
 	// servers 配置
 	buf.WriteString("# 服务器配置（多服务器模式）\n")
@@ -545,6 +576,7 @@ func GenerateConfigYAML(cfg *Config) ([]byte, error) {
 	buf.WriteString("    #     state_path: \"/var/lib/lolly/acme\"  # 账户与证书持久化目录（权限 0700）\n")
 	buf.WriteString("    #     challenge: \"tls-alpn-01\"     # 挑战类型（有效值: tls-alpn-01, http-01）\n")
 	buf.WriteString("    #     hosts: []                    # 申请域名（为空时使用 server_names，再次之 name）\n")
+	buf.WriteString("    #     allow_dynamic_hosts: false   # 允许容器发现扩充域名白名单，仅用于 HTTPS 模板\n")
 	buf.WriteString("    #     eab_kid: \"\"                  # 外部账户绑定 Key ID（可选，部分 CA 需要）\n")
 	buf.WriteString("    #     eab_hmac_key: \"\"             # 外部账户绑定 HMAC 密钥（base64url，可选）\n")
 	buf.WriteString("    # 说明：cert/key 已配置时优先使用静态证书；通配符域名需 DNS-01 挑战，暂不支持\n")

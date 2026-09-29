@@ -88,6 +88,24 @@ func (m *mockResolver) Stats() resolver.Stats {
 	}
 }
 
+// TestProxyCloseIsIdempotent 验证关闭代理可重复调用并释放生命周期资源。
+func TestProxyCloseIsIdempotent(t *testing.T) {
+	p, err := NewProxy(&config.ProxyConfig{}, []*loadbalance.Target{
+		loadbalance.NewTargetFromConfig("http://127.0.0.1:8080", 1, 0, 0, 0, false, false, ""),
+	}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	p.Close()
+	p.Close()
+	select {
+	case <-p.stopCh:
+	default:
+		t.Fatal("关闭代理后停止信号应已关闭")
+	}
+}
+
 // TestSetResolver 测试设置 DNS 解析器。
 func TestSetResolver(t *testing.T) {
 	cfg := &config.ProxyConfig{

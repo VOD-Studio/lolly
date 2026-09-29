@@ -20,11 +20,13 @@
 package ssl
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/base64"
 	"fmt"
 	"net/http"
 	"strings"
+	"sync/atomic"
 
 	"golang.org/x/crypto/acme"
 	"golang.org/x/crypto/acme/autocert"
@@ -48,8 +50,14 @@ type ACMEManager struct {
 	// mgr 底层 autocert 管理器
 	mgr *autocert.Manager
 
-	// hosts 允许申请证书的域名白名单，空表示不限制
-	hosts map[string]bool
+	// staticHosts 保存启动时配置的域名白名单，nil 表示传统的不限制模式
+	staticHosts map[string]bool
+
+	// dynamicHosts 原子保存发现服务发布的不可变域名集合
+	dynamicHosts atomic.Pointer[map[string]bool]
+
+	// dynamicStrict 表示动态集合为空时仍必须拒绝未知域名
+	dynamicStrict bool
 
 	// http01 是否启用 http-01 挑战
 	http01 bool
@@ -102,8 +110,9 @@ func NewACMEManager(cfg *config.ACMEConfig, hosts []string) (*ACMEManager, error
 	}
 
 	m := &ACMEManager{
-		mgr:    mgr,
-		http01: challenge == config.ACMEChallengeHTTP01,
+		mgr:           mgr,
+		http01:        challenge == config.ACMEChallengeHTTP01,
+		dynamicStrict: cfg.AllowDynamicHosts,
 	}
 
 	// 域名白名单：限制只为已配置域名签发证书
@@ -116,11 +125,13 @@ func NewACMEManager(cfg *config.ACMEConfig, hosts []string) (*ACMEManager, error
 		}
 		logging.Warn().Msg("ACME 未配置域名白名单，将为任意 SNI 域名尝试签发证书，存在触发 CA 速率限制的风险")
 	} else {
-		mgr.HostPolicy = autocert.HostWhitelist(whitelist...)
-		m.hosts = make(map[string]bool, len(whitelist))
+		m.staticHosts = make(map[string]bool, len(whitelist))
 		for _, h := range whitelist {
-			m.hosts[h] = true
+			m.staticHosts[h] = true
 		}
+	}
+	if len(whitelist) > 0 || m.dynamicStrict {
+		mgr.HostPolicy = m.hostPolicy
 	}
 
 	logging.Info().
@@ -178,10 +189,34 @@ func (m *ACMEManager) HTTP01() bool {
 // 返回值：
 //   - bool: 属于签发范围返回 true
 func (m *ACMEManager) HasHost(host string) bool {
-	if len(m.hosts) == 0 {
+	host = normalizeACMEHost(host)
+	if m.staticHosts[host] {
 		return true
 	}
-	return m.hosts[normalizeACMEHost(host)]
+	if dynamic := m.dynamicHosts.Load(); dynamic != nil && (*dynamic)[host] {
+		return true
+	}
+	return len(m.staticHosts) == 0 && !m.dynamicStrict
+}
+
+// SetDynamicHosts 原子替换运行时发现的域名白名单。
+//
+// 参数：
+//   - hosts: 当前完整动态域名集合；空集合在严格模式下拒绝所有动态域名
+func (m *ACMEManager) SetDynamicHosts(hosts []string) {
+	set := make(map[string]bool)
+	for _, host := range normalizeACMEHosts(hosts) {
+		set[host] = true
+	}
+	m.dynamicHosts.Store(&set)
+}
+
+// hostPolicy 在签发入口检查静态与动态白名单。
+func (m *ACMEManager) hostPolicy(_ context.Context, host string) error {
+	if m.HasHost(host) {
+		return nil
+	}
+	return fmt.Errorf("acme/autocert: host %q not configured in HostWhitelist", host)
 }
 
 // ACMEALPNProto 返回 tls-alpn-01 挑战所需的 ALPN 协议标识。

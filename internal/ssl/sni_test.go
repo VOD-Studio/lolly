@@ -149,6 +149,48 @@ func TestNewSNIManager_NoDefaultNoMatch_FallsBackToFirst(t *testing.T) {
 	}
 }
 
+func TestSNIManagerDynamicHostsUseTemplateWithoutChangingUnknownFallback(t *testing.T) {
+	dir := t.TempDir()
+	defaultCert, defaultKey := writeTestCert(t, dir, "default")
+	acme, err := NewACMEManager(&config.ACMEConfig{Enabled: true, AllowDynamicHosts: true, StatePath: dir}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr, err := NewSNIManager(nil, &config.SSLConfig{Cert: defaultCert, Key: defaultKey}, WithDynamicSNIACME(&config.SSLConfig{ACME: config.ACMEConfig{Enabled: true, AllowDynamicHosts: true}}, acme))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Close()
+
+	fallback, err := mgr.TLSConfig().GetConfigForClient(&tls.ClientHelloInfo{ServerName: "unknown.example"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr.SetDynamicHosts([]string{"dynamic.example"})
+	dynamic, err := mgr.TLSConfig().GetConfigForClient(&tls.ClientHelloInfo{ServerName: "dynamic.example"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	unknown, err := mgr.TLSConfig().GetConfigForClient(&tls.ClientHelloInfo{ServerName: "unknown.example"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dynamic.GetCertificate == nil {
+		t.Fatal("动态域名应选择模板 ACME TLS 配置")
+	}
+	if unknown.GetCertificate != nil || len(unknown.Certificates) == 0 || len(fallback.Certificates) == 0 {
+		t.Fatal("未知域名应保持原默认策略")
+	}
+	mgr.SetDynamicHosts(nil)
+	removed, err := mgr.TLSConfig().GetConfigForClient(&tls.ClientHelloInfo{ServerName: "dynamic.example"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed.GetCertificate != nil || len(removed.Certificates) == 0 {
+		t.Fatal("移除后不应继续选择动态模板")
+	}
+}
+
 func TestNewSNIManager_InvalidEntry(t *testing.T) {
 	_, err := NewSNIManager([]SNIEntry{
 		{Name: "a.example.com", SSL: &config.SSLConfig{Cert: "missing.pem", Key: "missing-key.pem"}},

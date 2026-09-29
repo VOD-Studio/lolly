@@ -60,12 +60,32 @@ func (p *Proxy) Start() error {
 	// 启动 DNS 刷新循环（如果配置了 resolver）
 	if p.resolver != nil {
 		if err := p.resolver.Start(); err != nil {
+			p.started.Store(false)
 			return fmt.Errorf("failed to start resolver: %w", err)
 		}
-		go p.startDNSRefreshLoop()
+		p.dnsWG.Add(1)
+		go func() {
+			defer p.dnsWG.Done()
+			p.startDNSRefreshLoop()
+		}()
 	}
 
 	return nil
+}
+
+// Close 停止后台刷新并关闭当前连接池中的空闲连接。
+//
+// 已在途请求仍持有 HostClient，可继续完成；重复调用不会再次关闭通道。
+func (p *Proxy) Close() {
+	p.closeOnce.Do(func() {
+		close(p.stopCh)
+		p.dnsWG.Wait()
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		for _, client := range p.clients {
+			client.CloseIdleConnections()
+		}
+	})
 }
 
 // startDNSRefreshLoop 启动 DNS 刷新后台循环。
@@ -214,6 +234,7 @@ func (p *Proxy) updateHostClientAddr(target *loadbalance.Target, ip string) {
 	}
 
 	p.clients[key] = newClient
+	oldClient.CloseIdleConnections()
 	logging.Debug().Msgf("Updated HostClient addr for %s to %s", target.URL, newAddr)
 }
 

@@ -131,6 +131,30 @@ func TestNewACMEManager_NoWhitelist(t *testing.T) {
 	}
 }
 
+// TestACMEManagerDynamicHosts 验证动态白名单为空时严格拒绝，并支持原子加入和移除。
+func TestACMEManagerDynamicHosts(t *testing.T) {
+	mgr, err := NewACMEManager(&config.ACMEConfig{
+		Enabled:           true,
+		AllowDynamicHosts: true,
+		StatePath:         t.TempDir(),
+	}, nil)
+	if err != nil {
+		t.Fatalf("NewACMEManager() error = %v", err)
+	}
+	if mgr.HasHost("dynamic.example") {
+		t.Fatal("空动态白名单不应允许任意域名")
+	}
+
+	mgr.SetDynamicHosts([]string{"Dynamic.Example."})
+	if !mgr.HasHost("dynamic.example") {
+		t.Fatal("加入后的动态域名应被允许")
+	}
+	mgr.SetDynamicHosts(nil)
+	if mgr.HasHost("dynamic.example") {
+		t.Fatal("移除后的动态域名应立即被拒绝")
+	}
+}
+
 // TestNewACMEManager_InvalidEAB 验证非法 EAB 密钥返回错误。
 func TestNewACMEManager_InvalidEAB(t *testing.T) {
 	_, err := NewACMEManager(&config.ACMEConfig{

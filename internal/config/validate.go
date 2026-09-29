@@ -789,12 +789,102 @@ func validateACME(a *ACMEConfig, serverNames []string, name string) error {
 		return errors.New("eab_kid 和 eab_hmac_key 必须同时配置")
 	}
 
-	// 域名来源缺失时无法申请证书
-	if len(a.ResolveHosts(serverNames, name)) == 0 {
+	// 常规服务器必须静态声明域名；容器发现模板则由受信任的发现结果
+	// 动态扩充白名单，启动时允许尚无域名。
+	if len(a.ResolveHosts(serverNames, name)) == 0 && !a.AllowDynamicHosts {
 		return errors.New("启用 ACME 时必须配置 hosts 或 server_names")
 	}
 
 	return ValidateNoNullByte(a.StatePath, "state_path")
+}
+
+// validateContainerDiscovery 验证容器发现配置及模板引用。
+//
+// 参数：
+//   - cfg: 容器发现配置
+//   - servers: 可供引用的服务器模板
+//
+// 返回值：
+//   - error: 配置不安全或模板不符合协议要求时返回错误
+func validateContainerDiscovery(cfg *ContainerDiscoveryConfig, servers []ServerConfig) error {
+	if err := ValidateNonNegativeDuration(cfg.ResyncInterval, "resync_interval"); err != nil {
+		return err
+	}
+	if err := ValidateNonNegativeDuration(cfg.Debounce, "debounce"); err != nil {
+		return err
+	}
+	if err := ValidateNonNegativeDuration(cfg.RequestTimeout, "request_timeout"); err != nil {
+		return err
+	}
+	if err := validateContainerDiscoveryACME(&cfg.ACME); err != nil {
+		return fmt.Errorf("acme: %w", err)
+	}
+	if !cfg.Enabled {
+		return nil
+	}
+	if !strings.HasPrefix(cfg.Endpoint, "unix://") || strings.TrimPrefix(cfg.Endpoint, "unix://") == "" {
+		return errors.New("endpoint 必须使用 unix:// 且包含套接字路径")
+	}
+	if strings.TrimSpace(cfg.Network) == "" {
+		return errors.New("启用时 network 必填")
+	}
+	if cfg.HTTPServer == "" && cfg.HTTPSServer == "" {
+		return errors.New("http_server 和 https_server 至少配置一个")
+	}
+	if err := validateDiscoveryTemplate(cfg.HTTPServer, false, servers); err != nil {
+		return fmt.Errorf("http_server: %w", err)
+	}
+	if err := validateDiscoveryTemplate(cfg.HTTPSServer, true, servers); err != nil {
+		return fmt.Errorf("https_server: %w", err)
+	}
+	return nil
+}
+
+// validateDiscoveryTemplate 验证模板名称唯一且协议类型匹配。
+func validateDiscoveryTemplate(name string, wantTLS bool, servers []ServerConfig) error {
+	if name == "" {
+		return nil
+	}
+	var matched *ServerConfig
+	for i := range servers {
+		if servers[i].Name != name {
+			continue
+		}
+		if matched != nil {
+			return fmt.Errorf("引用的 ServerConfig.Name %q 必须唯一", name)
+		}
+		matched = &servers[i]
+	}
+	if matched == nil {
+		return fmt.Errorf("未找到名为 %q 的服务器模板", name)
+	}
+	if wantTLS && !matched.UsesTLS() {
+		return errors.New("HTTPS 模板必须启用 TLS")
+	}
+	if !wantTLS && matched.UsesTLS() {
+		return errors.New("HTTP 模板必须是明文")
+	}
+	if wantTLS && matched.SSL.ACME.Enabled && !matched.SSL.ACME.AllowDynamicHosts {
+		return errors.New("ACME HTTPS 模板必须启用 allow_dynamic_hosts")
+	}
+	if wantTLS && !matched.SSL.ACME.Enabled {
+		return errors.New("HTTPS 模板必须启用 ACME 才能为动态域名提供证书")
+	}
+	return nil
+}
+
+// validateContainerDiscoveryACME 验证发现服务使用的 ACME 参数。
+func validateContainerDiscoveryACME(cfg *ContainerDiscoveryACMEConfig) error {
+	if cfg.Directory != "" {
+		u, err := url.Parse(cfg.Directory)
+		if err != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") {
+			return fmt.Errorf("无效的 directory URL: %s", cfg.Directory)
+		}
+	}
+	if cfg.Challenge != "" && cfg.Challenge != ACMEChallengeTLSALPN01 && cfg.Challenge != ACMEChallengeHTTP01 {
+		return fmt.Errorf("无效的 challenge: %s", cfg.Challenge)
+	}
+	return ValidateNoNullByte(cfg.StatePath, "state_path")
 }
 
 // validateSecurity 验证安全配置。

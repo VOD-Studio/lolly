@@ -20,6 +20,7 @@
 package server
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -33,6 +34,7 @@ import (
 	"github.com/valyala/fasthttp"
 	"rua.plus/lolly/internal/cache"
 	"rua.plus/lolly/internal/config"
+	containerdiscovery "rua.plus/lolly/internal/discovery/container"
 	"rua.plus/lolly/internal/handler"
 	"rua.plus/lolly/internal/http2"
 	"rua.plus/lolly/internal/logging"
@@ -65,44 +67,51 @@ const acmeChallengePath = "/.well-known/acme-challenge/"
 //   - 创建后需调用 Start 方法启动服务器
 //   - 关闭时建议使用 GracefulStop 实现优雅关闭
 type Server struct {
-	handler             fasthttp.RequestHandler
-	resolver            resolver.Resolver
-	tlsManager          *ssl.TLSManager
-	tlsManagers         []*ssl.TLSManager
-	sniManagers         []*ssl.SNIManager
-	acmeManagers        []*ssl.ACMEManager
-	certMonitor         *ssl.CertMonitor
-	tlsManagersMu       sync.Mutex
-	accessLogMiddleware *accesslog.AccessLog
-	luaEngine           *lua.LuaEngine
-	accessControl       *security.AccessControl
-	accessControls      []*security.AccessControl
-	accessControlsMu    sync.Mutex
-	rateLimiters        []*security.RateLimiter
-	rateLimitersMu      sync.Mutex
-	errorPageManager    *handler.ErrorPageManager
-	fileCache           *cache.FileCache
-	pool                *GoroutinePool
-	upgradeManager      *UpgradeManager
-	config              *config.Config
-	fastServer          *fasthttp.Server
-	fastServers         []*fasthttp.Server // 多监听器模式使用
-	proxies             []*proxy.Proxy
-	proxiesMu           sync.RWMutex
-	providedListeners   []net.Listener
-	listeners           []net.Listener
-	listenersMu         sync.Mutex
-	h2cServers          []*http2.Server
-	h2cServersMu        sync.Mutex
-	healthCheckers      []*proxy.HealthChecker
-	locationEngine      *matcher.LocationEngine
-	startTime           time.Time
-	connections         atomic.Int64
-	requests            atomic.Int64
-	bytesSent           atomic.Int64
-	bytesReceived       atomic.Int64
-	running             atomic.Bool
-	cleanupOnce         sync.Once
+	handler                  fasthttp.RequestHandler
+	resolver                 resolver.Resolver
+	tlsManager               *ssl.TLSManager
+	tlsManagers              []*ssl.TLSManager
+	sniManagers              []*ssl.SNIManager
+	acmeManagers             []*ssl.ACMEManager
+	certMonitor              *ssl.CertMonitor
+	tlsManagersMu            sync.Mutex
+	accessLogMiddleware      *accesslog.AccessLog
+	luaEngine                *lua.LuaEngine
+	accessControl            *security.AccessControl
+	accessControls           []*security.AccessControl
+	accessControlsMu         sync.Mutex
+	rateLimiters             []*security.RateLimiter
+	rateLimitersMu           sync.Mutex
+	errorPageManager         *handler.ErrorPageManager
+	fileCache                *cache.FileCache
+	pool                     *GoroutinePool
+	upgradeManager           *UpgradeManager
+	config                   *config.Config
+	fastServer               *fasthttp.Server
+	fastServers              []*fasthttp.Server // 多监听器模式使用
+	proxies                  []*proxy.Proxy
+	proxiesMu                sync.RWMutex
+	providedListeners        []net.Listener
+	listeners                []net.Listener
+	listenersMu              sync.Mutex
+	h2cServers               []*http2.Server
+	h2cServersMu             sync.Mutex
+	healthCheckers           []*proxy.HealthChecker
+	locationEngine           *matcher.LocationEngine
+	startTime                time.Time
+	connections              atomic.Int64
+	requests                 atomic.Int64
+	bytesSent                atomic.Int64
+	bytesReceived            atomic.Int64
+	running                  atomic.Bool
+	cleanupOnce              sync.Once
+	containerDiscoveryCancel context.CancelFunc
+	containerWatcher         *containerdiscovery.Watcher
+	containerDiscoveryWG     sync.WaitGroup
+	containerRoutersMu       sync.Mutex
+	containerRouters         []*containerRouter
+	containerTLSBindings     []containerTLSBinding
+	containerSnapshot        containerdiscovery.Snapshot
 }
 
 // New 创建 HTTP 服务器实例。
@@ -380,6 +389,14 @@ func (s *Server) start() error {
 
 	// 记录启动时间
 	s.startTime = time.Now()
+
+	// 首次发现必须先于 ACME 与 SNI 管理器构建，以提供初始动态白名单和账户邮箱。
+	if err := s.initContainerDiscovery(); err != nil {
+		return err
+	}
+
+	// 容器发现账户参数必须在 ACME 管理器创建前固定，运行期不切换账户邮箱。
+	s.applyContainerDiscoveryACME()
 
 	// 初始化 ACME 自动证书管理器（须在注册路由与创建 TLS 之前）
 	if initErr := s.initACMEManagers(); initErr != nil {
@@ -695,6 +712,13 @@ func (s *Server) startSingleMode() error {
 	if err != nil {
 		return err
 	}
+	dynamic, err := s.containerRouterForGroup(listenGroup{listen: serverCfg.Listen, indices: []int{0}})
+	if err != nil {
+		return err
+	}
+	if dynamic != nil {
+		handler = dynamic.wrap(handler)
+	}
 	s.handler = handler
 
 	s.fastServer = s.createFastServer(serverCfg, s.handler, anyProxyRequestStreaming(serverCfg))
@@ -734,6 +758,7 @@ func (s *Server) startMultiServerMode() error {
 		serveListeners = append(serveListeners, s.wrapGroupH2C(ln, group, fastSrv, groupHandler))
 	}
 
+	s.startContainerDiscovery()
 	s.running.Store(true)
 	serve := make([]func() error, len(s.fastServers))
 	for i := range s.fastServers {
@@ -865,6 +890,13 @@ func (s *Server) buildListenGroupServer(group listenGroup) (*fasthttp.Server, fa
 		}
 	}
 	groupHandler := vhosts.Handler()
+	dynamic, err := s.containerRouterForGroup(group)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to build container middleware chain: %w", err)
+	}
+	if dynamic != nil {
+		groupHandler = dynamic.wrap(groupHandler)
+	}
 	fastSrv := s.createFastServer(representative, groupHandler, streamReqBody)
 	if !representative.UsesTLS() {
 		return fastSrv, groupHandler, nil
@@ -882,7 +914,18 @@ func (s *Server) buildListenGroupServer(group listenGroup) (*fasthttp.Server, fa
 			acmeManagers[localIndex] = manager
 		}
 	}
-	sniManager, err := ssl.BuildSNIManager(groupConfigs, defaultLocalIndex, ssl.WithSNIACMEManagers(acmeManagers))
+	sniOptions := []ssl.SNIOption{ssl.WithSNIACMEManagers(acmeManagers)}
+	dynamicLocalIndex := -1
+	if template := s.config.ContainerDiscovery.HTTPSServer; s.config.ContainerDiscovery.Enabled && template != "" {
+		for localIndex, originalIndex := range group.indices {
+			if s.config.Servers[originalIndex].Name == template {
+				dynamicLocalIndex = localIndex
+				sniOptions = append(sniOptions, ssl.WithDynamicSNIACME(&groupConfigs[localIndex].SSL, acmeManagers[localIndex]))
+				break
+			}
+		}
+	}
+	sniManager, err := ssl.BuildSNIManager(groupConfigs, defaultLocalIndex, sniOptions...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to build SNI manager for %s: %w", group.listen, err)
 	}
@@ -891,6 +934,14 @@ func (s *Server) buildListenGroupServer(group listenGroup) (*fasthttp.Server, fa
 		s.tlsManagersMu.Lock()
 		s.sniManagers = append(s.sniManagers, sniManager)
 		s.tlsManagersMu.Unlock()
+		if dynamicLocalIndex >= 0 {
+			s.containerRoutersMu.Lock()
+			binding := containerTLSBinding{acme: acmeManagers[dynamicLocalIndex], sni: sniManager}
+			_, hosts := containerTLSHosts(s.containerSnapshot)
+			binding.sni.SetDynamicHosts(hosts)
+			s.containerTLSBindings = append(s.containerTLSBindings, binding)
+			s.containerRoutersMu.Unlock()
+		}
 	}
 
 	// HTTP/2 是连接级协议：同一监听分组内任一虚拟主机启用 h2 即在
@@ -1017,11 +1068,19 @@ func (s *Server) startServer(idx int, serverCfg *config.ServerConfig, fastSrv *f
 		s.tlsManagersMu.Lock()
 		s.tlsManagers = append(s.tlsManagers, tlsManager)
 		s.tlsManagersMu.Unlock()
+		if serverCfg.Name == s.config.ContainerDiscovery.HTTPSServer && serverCfg.SSL.ACME.AllowDynamicHosts {
+			s.containerRoutersMu.Lock()
+			s.containerTLSBindings = append(s.containerTLSBindings, containerTLSBinding{acme: s.acmeManagerAt(idx)})
+			s.containerRoutersMu.Unlock()
+		}
 	}
 
 	// HTTP/2 经 ALPN 分派挂载到 fasthttp.Server，复用其监听器与连接
 	// 生命周期，避免与 fasthttp 抢占同一监听器的 Accept 循环。
 	s.attachHTTP2(fastSrv, serverCfg, s.handler)
+
+	// 单服务器的 TLS 管理器到此才完成构建，随后才能启动后台发现。
+	s.startContainerDiscovery()
 
 	if fastSrv.TLSConfig != nil {
 		return fastSrv.ServeTLS(ln, "", "")

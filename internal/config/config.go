@@ -72,17 +72,18 @@ const (
 //	    // 处理每个服务器配置
 //	}
 type Config struct {
-	Mode        ServerMode        `yaml:"mode"`
-	Variables   VariablesConfig   `yaml:"variables"`
-	Logging     LoggingConfig     `yaml:"logging"`
-	Servers     []ServerConfig    `yaml:"servers"`
-	Stream      []StreamConfig    `yaml:"stream"`
-	Monitoring  MonitoringConfig  `yaml:"monitoring"`
-	HTTP3       HTTP3Config       `yaml:"http3"`
-	Resolver    ResolverConfig    `yaml:"resolver"`
-	Performance PerformanceConfig `yaml:"performance"`
-	Shutdown    ShutdownConfig    `yaml:"shutdown"`
-	Include     []IncludeConfig   `yaml:"include"` // 配置引入，支持从其他文件引入配置片段
+	Mode               ServerMode               `yaml:"mode"`
+	Variables          VariablesConfig          `yaml:"variables"`
+	Logging            LoggingConfig            `yaml:"logging"`
+	Servers            []ServerConfig           `yaml:"servers"`
+	Stream             []StreamConfig           `yaml:"stream"`
+	Monitoring         MonitoringConfig         `yaml:"monitoring"`
+	HTTP3              HTTP3Config              `yaml:"http3"`
+	Resolver           ResolverConfig           `yaml:"resolver"`
+	Performance        PerformanceConfig        `yaml:"performance"`
+	Shutdown           ShutdownConfig           `yaml:"shutdown"`
+	ContainerDiscovery ContainerDiscoveryConfig `yaml:"container_discovery"`
+	Include            []IncludeConfig          `yaml:"include"` // 配置引入，支持从其他文件引入配置片段
 }
 
 // parseSize 解析大小字符串（支持 k, m 单位）。
@@ -382,6 +383,11 @@ func Validate(cfg *Config) error {
 	// 验证变量配置
 	if err := validateVariables(&cfg.Variables); err != nil {
 		return fmt.Errorf("variables: %w", err)
+	}
+
+	// 验证容器发现配置及其服务器模板引用
+	if err := validateContainerDiscovery(&cfg.ContainerDiscovery, cfg.Servers); err != nil {
+		return fmt.Errorf("container_discovery: %w", err)
 	}
 
 	// 验证关闭配置

@@ -60,6 +60,10 @@ func (s *Server) initACMEManagers() error {
 		if err != nil {
 			return fmt.Errorf("servers[%d]: 初始化 ACME 失败: %w", i, err)
 		}
+		if srv.SSL.ACME.AllowDynamicHosts {
+			hosts, _ := containerTLSHosts(s.containerSnapshot)
+			mgr.SetDynamicHosts(hosts)
+		}
 		managers[i] = mgr
 	}
 

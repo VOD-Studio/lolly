@@ -94,6 +94,8 @@ func TestGenerateConfigYAMLFieldsCoverage(t *testing.T) {
 		{reflect.TypeFor[LuaGlobalSettings](), "LuaGlobalSettings"},
 		{reflect.TypeFor[LimitRateConfig](), "LimitRateConfig"},
 		{reflect.TypeFor[TypesConfig](), "TypesConfig"},
+		{reflect.TypeFor[ContainerDiscoveryConfig](), "ContainerDiscoveryConfig"},
+		{reflect.TypeFor[ContainerDiscoveryACMEConfig](), "ContainerDiscoveryACMEConfig"},
 	}
 
 	for _, c := range checks {

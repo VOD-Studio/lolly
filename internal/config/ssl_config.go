@@ -136,6 +136,10 @@ type ACMEConfig struct {
 
 	// Enabled 是否启用 ACME 自动证书
 	Enabled bool `yaml:"enabled"`
+
+	// AllowDynamicHosts 是否允许运行时发现的域名进入证书白名单
+	// 仅应由受信任的容器发现机制使用，避免为任意请求 Host 签发证书
+	AllowDynamicHosts bool `yaml:"allow_dynamic_hosts"`
 }
 
 // ResolveHosts 推导 ACME 申请证书使用的域名列表。

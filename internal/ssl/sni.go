@@ -15,6 +15,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"sync/atomic"
 
 	"rua.plus/lolly/internal/config"
 	"rua.plus/lolly/internal/hostmatch"
@@ -46,6 +47,10 @@ type sniOptions struct {
 	acmes map[int]*ACMEManager
 	// defaultACME 默认虚拟主机的 ACME 管理器
 	defaultACME *ACMEManager
+	// dynamicCfg 容器发现 HTTPS 模板配置
+	dynamicCfg *config.SSLConfig
+	// dynamicACME 容器发现 HTTPS 模板 ACME 管理器
+	dynamicACME *ACMEManager
 }
 
 // SNIOption 配置 SNI 管理器构建过程的可选参数。
@@ -77,15 +82,25 @@ func WithDefaultACMEManager(mgr *ACMEManager) SNIOption {
 	}
 }
 
+// WithDynamicSNIACME 设置动态域名使用的 HTTPS 模板。
+func WithDynamicSNIACME(cfg *config.SSLConfig, mgr *ACMEManager) SNIOption {
+	return func(o *sniOptions) {
+		o.dynamicCfg = cfg
+		o.dynamicACME = mgr
+	}
+}
+
 // SNIManager 基于 SNI 在同一监听端口上按域名选择证书。
 //
 // 每个虚拟主机拥有独立的 *TLSManager（独立证书、协议、加密套件、
 // Session Ticket、OCSP Stapling、mTLS 配置），SNIManager 仅负责在
 // TLS 握手时根据 ClientHelloInfo.ServerName 选出对应的 TLSManager。
 type SNIManager struct {
-	matcher    *hostmatch.Matcher[*TLSManager]
-	managers   []*TLSManager
-	defaultMgr *TLSManager
+	matcher      *hostmatch.Matcher[*TLSManager]
+	managers     []*TLSManager
+	defaultMgr   *TLSManager
+	dynamicMgr   *TLSManager
+	dynamicHosts atomic.Pointer[map[string]bool]
 }
 
 // NewSNIManager 根据虚拟主机列表创建 SNI 管理器。
@@ -122,6 +137,16 @@ func NewSNIManager(entries []SNIEntry, defaultCfg *config.SSLConfig, opts ...SNI
 		m.managers = append(m.managers, mgr)
 	}
 
+	if o.dynamicCfg != nil {
+		mgr, err := NewTLSManager(o.dynamicCfg, WithACMEManager(o.dynamicACME))
+		if err != nil {
+			m.Close()
+			return nil, fmt.Errorf("ssl: failed to create dynamic TLS manager: %w", err)
+		}
+		m.dynamicMgr = mgr
+		m.managers = append(m.managers, mgr)
+	}
+
 	if defaultCfg != nil {
 		mgr, err := NewTLSManager(defaultCfg, WithACMEManager(o.defaultACME))
 		if err != nil {
@@ -129,7 +154,6 @@ func NewSNIManager(entries []SNIEntry, defaultCfg *config.SSLConfig, opts ...SNI
 			return nil, fmt.Errorf("ssl: failed to create default TLS manager: %w", err)
 		}
 		m.defaultMgr = mgr
-		m.matcher.SetDefault(mgr)
 		m.managers = append(m.managers, mgr)
 	}
 
@@ -197,6 +221,9 @@ func (m *SNIManager) getConfigForClient(hello *tls.ClientHelloInfo) (*tls.Config
 			}
 			return mgr.GetTLSConfig(), nil
 		}
+		if hosts := m.dynamicHosts.Load(); m.dynamicMgr != nil && hosts != nil && (*hosts)[normalizeACMEHost(hello.ServerName)] {
+			return m.dynamicMgr.GetTLSConfig(), nil
+		}
 	}
 
 	if mgr := m.fallbackManager(); mgr != nil {
@@ -207,6 +234,15 @@ func (m *SNIManager) getConfigForClient(hello *tls.ClientHelloInfo) (*tls.Config
 	}
 
 	return nil, errors.New("ssl: no TLS configuration available for SNI")
+}
+
+// SetDynamicHosts 原子替换选择 HTTPS 模板的动态 SNI 域名集合。
+func (m *SNIManager) SetDynamicHosts(hosts []string) {
+	set := make(map[string]bool)
+	for _, host := range normalizeACMEHosts(hosts) {
+		set[host] = true
+	}
+	m.dynamicHosts.Store(&set)
 }
 
 // Close 关闭所有底层 TLSManager，释放 OCSP / Session Ticket 相关资源。
@@ -298,5 +334,9 @@ func BuildSNIManager(servers []config.ServerConfig, defaultIdx int, opts ...SNIO
 		return nil, nil
 	}
 
-	return NewSNIManager(entries, defaultCfg, WithDefaultACMEManager(defaultACME))
+	options := []SNIOption{WithDefaultACMEManager(defaultACME)}
+	if o.dynamicCfg != nil {
+		options = append(options, WithDynamicSNIACME(o.dynamicCfg, o.dynamicACME))
+	}
+	return NewSNIManager(entries, defaultCfg, options...)
 }

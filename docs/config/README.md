@@ -136,6 +136,56 @@ docs/config/
 | URL 重写 | ✓ `rewrite` 配置 |
 | Lua 脚本 | ✓ 内置 Lua 沙箱 |
 
+## 容器发现
+
+顶层 `container_discovery` 用于根据容器元数据动态创建虚拟主机，默认禁用。当前仅支持通过 Unix socket 连接容器运行时；启用时必须指定容器网络，并可按需引用 HTTP、HTTPS 服务器模板。
+
+```yaml
+container_discovery:
+  enabled: true
+  endpoint: "unix:///var/run/docker.sock"
+  network: "frontend"
+  http_server: "container-http"
+  https_server: "container-https"
+  resync_interval: 30s
+  debounce: 200ms
+  request_timeout: 5s
+  required: false
+  acme:
+    email: "admin@example.com"
+    directory: "https://acme-v02.api.letsencrypt.org/directory"
+    state_path: "/var/lib/lolly/acme"
+    challenge: "tls-alpn-01"
+
+servers:
+  - name: "container-http"       # name 必须唯一，且模板必须为明文
+    listen: ":80"
+  - name: "container-https"      # name 必须唯一，且模板必须启用 TLS
+    listen: ":443"
+    ssl:
+      acme:
+        enabled: true
+        allow_dynamic_hosts: true # 只允许受信任的发现结果扩充证书域名白名单
+```
+
+`resync_interval`、`debounce` 和 `request_timeout` 不得为负数；前两者为 `0` 时分别使用默认 30 秒和不防抖，`request_timeout: 0` 使用默认 5 秒。`required: true` 表示发现服务初始化失败时应阻止启动。HTTPS 模板使用 ACME 时必须显式开启 `ssl.acme.allow_dynamic_hosts`；普通 ACME 服务仍需通过 `hosts`、`server_names` 或 `name` 声明静态域名。
+
+发现器兼容 Docker 和 Podman 的 Docker-compatible Unix socket API。启动时执行一次全量扫描，之后监听容器/网络事件，并通过周期扫描补偿事件断线。API 暂时失败时保留最后一次成功路由。
+
+支持以下 nginx-proxy 环境变量：
+
+- `VIRTUAL_HOST`、`VIRTUAL_PORT`、`VIRTUAL_PROTO=http|https`
+- `VIRTUAL_PATH`、`VIRTUAL_DEST`
+- `VIRTUAL_HOST_MULTIPORTS`（YAML 或 JSON）
+- `EXTERNAL_HTTP_PORT`、`EXTERNAL_HTTPS_PORT`
+- `HTTPS_METHOD=redirect|noredirect|nohttp|nohttps`
+- `LETSENCRYPT_HOST` / `ACME_HOST`
+- `LETSENCRYPT_EMAIL` / `ACME_EMAIL`
+
+相同 Host 和 Path 的多个容器会组成轮询上游。静态 `server_name` 始终优先于容器声明。只有显式出现在 `LETSENCRYPT_HOST` 或 `ACME_HOST` 中且同时匹配 `VIRTUAL_HOST` 的域名才会启用动态 HTTPS 和证书签发；未声明证书域名的服务保持 HTTP，避免重定向到不可用的 HTTPS。ACME 账户邮箱在启动时确定：优先使用 `container_discovery.acme.email`，其次使用 HTTPS 模板邮箱，最后使用首次发现结果中的第一个容器邮箱；后续容器邮箱不同时只记录告警。
+
+当前不支持 nginx-proxy 的正则/通配符动态 Host、正则 `VIRTUAL_PATH`、FastCGI/uWSGI、DNS-01 provider 配置及挂载式 nginx 配置片段；这些声明会被拒绝或跳过并记录告警。
+
 ## ACME 自动证书（Let's Encrypt）
 
 lolly 内置 ACME 客户端，可直接向 Let's Encrypt 等 CA 申请证书并在到期前
