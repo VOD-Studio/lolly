@@ -120,6 +120,7 @@ func validateModeConstraints(cfg *Config) error {
 				return errors.New("vhost 模式只能使用一个 listen 地址")
 			}
 		}
+	case ServerModeMultiServer, ServerModeAuto, "":
 	}
 	return nil
 }

@@ -98,8 +98,9 @@ func (a *App) logServerAddresses() {
 	if len(a.cfg.Servers) == 0 {
 		return
 	}
+	const listenField = "listen"
 	for listen := range uniqueListens(a.cfg.Servers) {
-		a.logger.LogStartup("Listening address", map[string]string{"listen": listen})
+		a.logger.LogStartup("Listening address", map[string]string{listenField: listen})
 	}
 }
 
