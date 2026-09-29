@@ -13,6 +13,7 @@
 //   - 使用 io.LimitReader 强制限制实际读取的字节数
 //   - 支持路径级别配置覆盖全局配置
 //   - 超限返回 413 Request Entity Too Large
+//   - 大小为 0（UnlimitedSize）表示不限制，与 nginx client_max_body_size 0 语义一致
 //
 // 作者：xfy
 package bodylimit
