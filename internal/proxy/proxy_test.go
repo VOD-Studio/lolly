@@ -345,7 +345,32 @@ func TestSelectTarget(t *testing.T) {
 	}
 }
 
-// TestModifyRequestHeaders 测试请求头修改
+// TestModifyRequestHeaders_PreservesForwardedHost 验证改写上游 Host 前保留客户端原始 Host。
+func TestModifyRequestHeaders_PreservesForwardedHost(t *testing.T) {
+	cfg := &config.ProxyConfig{
+		Path:        "/",
+		LoadBalance: "round_robin",
+		Timeout:     config.ProxyTimeout{Connect: time.Second},
+	}
+	target := &loadbalance.Target{URL: "http://backend.example.com:8080"}
+	p, err := NewProxy(cfg, []*loadbalance.Target{target}, nil, nil)
+	if err != nil {
+		t.Fatalf("NewProxy() error: %v", err)
+	}
+
+	ctx := testutil.NewRequestCtx("GET", "/")
+	ctx.Request.Header.SetHost("client.example.com")
+	p.modifyRequestHeaders(ctx, target)
+
+	if got := string(ctx.Request.Header.Host()); got != "backend.example.com:8080" {
+		t.Errorf("Host = %q, want %q", got, "backend.example.com:8080")
+	}
+	if got := string(ctx.Request.Header.Peek("X-Forwarded-Host")); got != "client.example.com" {
+		t.Errorf("X-Forwarded-Host = %q, want %q", got, "client.example.com")
+	}
+}
+
+// TestModifyRequestHeaders 测试请求头修改。
 func TestModifyRequestHeaders(t *testing.T) {
 	tests := []struct {
 		name           string

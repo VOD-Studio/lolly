@@ -29,15 +29,15 @@ import (
 func (p *Proxy) modifyRequestHeaders(ctx *fasthttp.RequestCtx, target *loadbalance.Target) {
 	headers := &ctx.Request.Header
 
+	// 覆盖 Host 前提取原始请求信息，避免 X-Forwarded-Host 误用上游地址。
+	fh := ExtractForwardedHeaders(ctx)
+
 	// 设置 Host header 为目标主机
 	// 从 target.URL 提取 host:port（HostClient 连接需要此格式）
 	targetHost, _ := netutil.ParseTargetURL(target.URL, false)
 	if targetHost != "" {
 		headers.Set("Host", targetHost)
 	}
-
-	// 提取并设置 X-Forwarded 系列头
-	fh := ExtractForwardedHeaders(ctx)
 
 	// 根据配置决定是否设置 X-Forwarded-Host 和 X-Forwarded-Proto
 	setHost := true // 默认值（向后兼容）
