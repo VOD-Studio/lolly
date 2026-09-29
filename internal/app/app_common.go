@@ -98,17 +98,8 @@ func (a *App) logServerAddresses() {
 	if len(a.cfg.Servers) == 0 {
 		return
 	}
-	mode := a.cfg.GetMode()
-	if mode == config.ServerModeMultiServer {
-		for i, srv := range a.cfg.Servers {
-			a.logger.LogStartup("Listening address", map[string]string{
-				"index":  fmt.Sprintf("[%d]", i),
-				"listen": srv.Listen,
-				"name":   srv.Name,
-			})
-		}
-	} else {
-		a.logger.LogStartup("Listening address", map[string]string{"listen": a.cfg.Servers[0].Listen})
+	for listen := range uniqueListens(a.cfg.Servers) {
+		a.logger.LogStartup("Listening address", map[string]string{"listen": listen})
 	}
 }
 

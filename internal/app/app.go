@@ -267,36 +267,26 @@ func (a *App) requiresFullRestart(newCfg *config.Config) bool {
 	if a.cfg.GetMode() != newCfg.GetMode() {
 		return true
 	}
-	oldMode := a.cfg.GetMode()
-	switch oldMode {
-	case config.ServerModeSingle:
-		if len(a.cfg.Servers) > 0 && len(newCfg.Servers) > 0 {
-			if a.cfg.Servers[0].Listen != newCfg.Servers[0].Listen {
-				return true
-			}
-		}
-	case config.ServerModeVHost:
-		if len(a.cfg.Servers) != len(newCfg.Servers) {
-			return true
-		}
-		if len(a.cfg.Servers) > 0 && len(newCfg.Servers) > 0 {
-			if a.cfg.Servers[0].Listen != newCfg.Servers[0].Listen {
-				return true
-			}
-		}
-	case config.ServerModeMultiServer:
-		if len(a.cfg.Servers) != len(newCfg.Servers) {
-			return true
-		}
-		for i := range a.cfg.Servers {
-			if a.cfg.Servers[i].Listen != newCfg.Servers[i].Listen {
-				return true
-			}
-		}
-	case config.ServerModeAuto:
+	oldListens := uniqueListens(a.cfg.Servers)
+	newListens := uniqueListens(newCfg.Servers)
+	if len(oldListens) != len(newListens) {
 		return true
 	}
+	for listen := range oldListens {
+		if !newListens[listen] {
+			return true
+		}
+	}
 	return false
+}
+
+// uniqueListens 返回配置实际需要创建的监听地址集合。
+func uniqueListens(servers []config.ServerConfig) map[string]bool {
+	listens := make(map[string]bool, len(servers))
+	for i := range servers {
+		listens[servers[i].Listen] = true
+	}
+	return listens
 }
 
 func (a *App) gracefulUpgrade() {
