@@ -91,6 +91,9 @@ type Server struct {
 	proxiesMu           sync.RWMutex
 	providedListeners   []net.Listener
 	listeners           []net.Listener
+	listenersMu         sync.Mutex
+	h2cServers          []*http2.Server
+	h2cServersMu        sync.Mutex
 	healthCheckers      []*proxy.HealthChecker
 	locationEngine      *matcher.LocationEngine
 	startTime           time.Time
@@ -268,7 +271,33 @@ func (s *Server) trackStats(handler fasthttp.RequestHandler) fasthttp.RequestHan
 // 返回值：
 //   - []net.Listener: 监听器列表
 func (s *Server) GetListeners() []net.Listener {
+	s.listenersMu.Lock()
+	defer s.listenersMu.Unlock()
 	return s.listeners
+}
+
+// appendListener 记录一个原始监听器。
+//
+// 只记录未包装的监听器：热升级与重载要用它继承 FD、DupListener 要按
+// *net.TCPListener/*net.UnixListener 取描述符，而 h2c 嗅探包装仅作用于
+// Serve 调用点。启动协程写入与 app 层读取并发，需加锁。
+//
+// 参数：
+//   - ln: 要记录的原始监听器
+func (s *Server) appendListener(ln net.Listener) {
+	s.listenersMu.Lock()
+	s.listeners = append(s.listeners, ln)
+	s.listenersMu.Unlock()
+}
+
+// resetListeners 重置监听器列表并按分组数预置容量。
+//
+// 参数：
+//   - n: 预计的监听器数量
+func (s *Server) resetListeners(n int) {
+	s.listenersMu.Lock()
+	s.listeners = make([]net.Listener, 0, n)
+	s.listenersMu.Unlock()
 }
 
 // SetListeners 设置服务器监听器列表。
@@ -380,6 +409,9 @@ func (s *Server) start() error {
 			return err
 		}
 	}
+
+	// 提示 h2c 相关的"配了但不生效"组合（校验层看不到监听器与虚拟主机的搭配）。
+	s.warnHTTP2H2CConfig()
 
 	// 单服务器保留 LocationEngine 路径，多条配置统一按 listen 分组。
 	if len(s.config.Servers) == 1 {
@@ -682,10 +714,11 @@ func (s *Server) startSingleMode() error {
 func (s *Server) startMultiServerMode() error {
 	groups := groupServersByListen(s.config.Servers)
 	s.fastServers = make([]*fasthttp.Server, 0, len(groups))
-	s.listeners = make([]net.Listener, 0, len(groups))
+	s.resetListeners(len(groups))
+	serveListeners := make([]net.Listener, 0, len(groups))
 
 	for _, group := range groups {
-		fastSrv, err := s.buildListenGroupServer(group)
+		fastSrv, groupHandler, err := s.buildListenGroupServer(group)
 		if err != nil {
 			s.closeActiveListeners()
 			return err
@@ -696,14 +729,16 @@ func (s *Server) startMultiServerMode() error {
 			return fmt.Errorf("failed to listen on %s: %w", group.listen, err)
 		}
 		s.fastServers = append(s.fastServers, fastSrv)
-		s.listeners = append(s.listeners, ln)
+		// 记录原始监听器：热升级与重载按它继承 FD，h2c 嗅探包装只在 Serve 前生效。
+		s.appendListener(ln)
+		serveListeners = append(serveListeners, s.wrapGroupH2C(ln, group, fastSrv, groupHandler))
 	}
 
 	s.running.Store(true)
 	serve := make([]func() error, len(s.fastServers))
 	for i := range s.fastServers {
 		fastSrv := s.fastServers[i]
-		ln := s.listeners[i]
+		ln := serveListeners[i]
 		serve[i] = func() error {
 			if fastSrv.TLSConfig != nil {
 				return fastSrv.ServeTLS(ln, "", "")
@@ -778,7 +813,18 @@ func groupServersByListen(servers []config.ServerConfig) []listenGroup {
 }
 
 // buildListenGroupServer 构建一个监听分组的 Host 路由和 TLS 配置。
-func (s *Server) buildListenGroupServer(group listenGroup) (*fasthttp.Server, error) {
+//
+// 返回值中的 handler 是分组内按 Host 分流的组合处理器，供明文 h2c 嗅探
+// 分派复用（h2c 连接上的请求同样要按 Host 落到对应虚拟主机）。
+//
+// 参数：
+//   - group: 共享同一监听地址的虚拟主机分组
+//
+// 返回值：
+//   - *fasthttp.Server: 该分组的 fasthttp.Server
+//   - fasthttp.RequestHandler: 该分组的组合请求处理器
+//   - error: 中间件链或 SNI 管理器构建失败时返回错误
+func (s *Server) buildListenGroupServer(group listenGroup) (*fasthttp.Server, fasthttp.RequestHandler, error) {
 	vhosts := NewVHostManager()
 	defaultIndex := group.indices[0]
 	for _, idx := range group.indices {
@@ -798,11 +844,11 @@ func (s *Server) buildListenGroupServer(group listenGroup) (*fasthttp.Server, er
 		s.registerACMEChallengeRouter(router)
 		h, err := s.wrapHandler(router.Handler(), serverCfg)
 		if err != nil {
-			return nil, fmt.Errorf("failed to build middleware chain (server[%d]): %w", idx, err)
+			return nil, nil, fmt.Errorf("failed to build middleware chain (server[%d]): %w", idx, err)
 		}
 		for _, name := range serverCfg.EffectiveServerNames() {
 			if err := vhosts.AddHost(name, h); err != nil {
-				return nil, fmt.Errorf("add host %s: %w", name, err)
+				return nil, nil, fmt.Errorf("add host %s: %w", name, err)
 			}
 		}
 		if idx == defaultIndex {
@@ -818,9 +864,10 @@ func (s *Server) buildListenGroupServer(group listenGroup) (*fasthttp.Server, er
 			break
 		}
 	}
-	fastSrv := s.createFastServer(representative, vhosts.Handler(), streamReqBody)
+	groupHandler := vhosts.Handler()
+	fastSrv := s.createFastServer(representative, groupHandler, streamReqBody)
 	if !representative.UsesTLS() {
-		return fastSrv, nil
+		return fastSrv, groupHandler, nil
 	}
 
 	groupConfigs := make([]config.ServerConfig, len(group.indices))
@@ -837,7 +884,7 @@ func (s *Server) buildListenGroupServer(group listenGroup) (*fasthttp.Server, er
 	}
 	sniManager, err := ssl.BuildSNIManager(groupConfigs, defaultLocalIndex, ssl.WithSNIACMEManagers(acmeManagers))
 	if err != nil {
-		return nil, fmt.Errorf("failed to build SNI manager for %s: %w", group.listen, err)
+		return nil, nil, fmt.Errorf("failed to build SNI manager for %s: %w", group.listen, err)
 	}
 	if sniManager != nil {
 		fastSrv.TLSConfig = sniManager.TLSConfig()
@@ -853,22 +900,26 @@ func (s *Server) buildListenGroupServer(group listenGroup) (*fasthttp.Server, er
 	// 不同虚拟主机的 h2 参数差异在连接级不感知，需要时按 vhost 细分。
 	for _, idx := range group.indices {
 		if s.config.Servers[idx].SSL.HTTP2.Enabled {
-			s.attachHTTP2(fastSrv, &s.config.Servers[idx], vhosts.Handler())
+			s.attachHTTP2(fastSrv, &s.config.Servers[idx], groupHandler)
 			break
 		}
 	}
 
-	return fastSrv, nil
+	return fastSrv, groupHandler, nil
 }
 
 // closeActiveListeners 关闭启动过程中已经激活的监听器。
 func (s *Server) closeActiveListeners() {
-	for _, ln := range s.listeners {
+	s.listenersMu.Lock()
+	listeners := s.listeners
+	s.listeners = nil
+	s.listenersMu.Unlock()
+
+	for _, ln := range listeners {
 		if ln != nil {
 			_ = ln.Close()
 		}
 	}
-	s.listeners = nil
 }
 
 // registerMonitoringEndpoints 注册状态监控、性能分析和缓存清理端点。
@@ -954,7 +1005,7 @@ func (s *Server) startServer(idx int, serverCfg *config.ServerConfig, fastSrv *f
 	if err != nil {
 		return fmt.Errorf("failed to listen: %w", err)
 	}
-	s.listeners = append(s.listeners, ln)
+	s.appendListener(ln)
 
 	if fastSrv.TLSConfig == nil && serverCfg.UsesTLS() {
 		tlsManager, err := ssl.NewTLSManager(&serverCfg.SSL, ssl.WithACMEManager(s.acmeManagerAt(idx)))
@@ -976,7 +1027,9 @@ func (s *Server) startServer(idx int, serverCfg *config.ServerConfig, fastSrv *f
 		return fastSrv.ServeTLS(ln, "", "")
 	}
 
-	return fastSrv.Serve(ln)
+	// 明文监听器：h2c 嗅探只包在 Serve 前，s.listeners 仍保留原始监听器，
+	// 热升级与重载的 FD 继承按原始监听器类型取描述符。
+	return fastSrv.Serve(s.wrapH2C(fastSrv, ln, serverCfg, s.handler))
 }
 
 // SetResolver 设置 DNS 解析器。
@@ -1000,7 +1053,23 @@ func (s *Server) attachHTTP2(fastSrv *fasthttp.Server, serverCfg *config.ServerC
 		return
 	}
 
-	h2cfg := &serverCfg.SSL.HTTP2
+	http2.Attach(fastSrv, s.prepareHTTP2Config(serverCfg), handler)
+}
+
+// prepareHTTP2Config 补全 HTTP/2 连接级的请求体参数。
+//
+// ALPN 挂载与明文 h2c 嗅探共用同一份推导逻辑：请求体上限取自虚拟主机的
+// client_max_body_size（解析失败用默认值），任一代理开启请求体流式时
+// h2 适配器同步流式读取。返回配置副本而非就地改写，避免多个监听分组
+// 先后推导时相互影响。
+//
+// 参数：
+//   - serverCfg: 虚拟主机配置
+//
+// 返回值：
+//   - *config.HTTP2Config: 补全请求体参数后的配置副本
+func (s *Server) prepareHTTP2Config(serverCfg *config.ServerConfig) *config.HTTP2Config {
+	h2cfg := serverCfg.SSL.HTTP2
 	if h2cfg.MaxBodySize <= 0 {
 		if size, err := bodylimit.ParseSize(serverCfg.ClientMaxBodySize); err == nil {
 			h2cfg.MaxBodySize = size
@@ -1010,5 +1079,114 @@ func (s *Server) attachHTTP2(fastSrv *fasthttp.Server, serverCfg *config.ServerC
 	}
 	h2cfg.StreamRequestBody = config.AnyProxyRequestStreaming(s.config.Servers)
 
-	http2.Attach(fastSrv, h2cfg, handler)
+	return &h2cfg
+}
+
+// wrapH2C 在不使用 TLS 的监听器上启用明文 HTTP/2（h2c）。
+//
+// 仅当 ssl.http2.enabled 与 ssl.http2.h2c_enabled 同时为 true 时生效，并同时
+// 挂上两种接入方式：
+//   - 监听器嗅探 HTTP/2 连接前导（prior knowledge），命中的请求由 http2.Server
+//     直接服务，其余连接回放原始字节交回 fasthttp 按 HTTP/1.1 处理；
+//   - fasthttp 处理器最外层拦截 Upgrade: h2c 握手，劫持连接写 101 后转 HTTP/2。
+//
+// TLS 监听器的协议分派由 ALPN 负责（见 attachHTTP2），此处不介入。
+//
+// 已知边界：h2c 连接不经过 fasthttp 的 Accept 循环，不受 max_conns_per_ip
+// 约束（多路复用下单连接即可承载全部请求，该限制语义不适用），连接总数
+// 用 serverCfg.Concurrency 约束，避免嗅探分派成为无界 goroutine 来源。
+//
+// 必须在 fastSrv 启动前调用：升级握手要包住整个处理器链，因此会就地替换
+// fastSrv.Handler，让握手不经过中间件、不计入访问日志与限流。
+//
+// 参数：
+//   - fastSrv: 待启用 h2c 的 fasthttp.Server（明文监听器）
+//   - ln: 原始明文监听器
+//   - serverCfg: 该监听分组代表虚拟主机的配置
+//   - handler: 该分组的 fasthttp 请求处理器
+//
+// 返回值：
+//   - net.Listener: 需要嗅探时返回包装监听器，否则原样返回 ln
+func (s *Server) wrapH2C(fastSrv *fasthttp.Server, ln net.Listener, serverCfg *config.ServerConfig, handler fasthttp.RequestHandler) net.Listener {
+	if fastSrv == nil || ln == nil || serverCfg == nil || handler == nil {
+		return ln
+	}
+	h2cfg := s.prepareHTTP2Config(serverCfg)
+	if !h2cfg.Enabled || !h2cfg.H2CEnabled {
+		return ln
+	}
+
+	h2s, err := http2.NewServer(h2cfg, handler, nil, http2.WithMaxConcurrentConns(serverCfg.Concurrency))
+	if err != nil {
+		logging.Error().Err(err).Msg("Failed to create h2c server")
+		return ln
+	}
+
+	// 升级握手放在处理器链最外层：被升级的请求不该走一遍业务中间件。
+	fastSrv.Handler = h2s.UpgradeHandler(handler)
+
+	s.h2cServersMu.Lock()
+	s.h2cServers = append(s.h2cServers, h2s)
+	s.h2cServersMu.Unlock()
+
+	logging.Info().
+		Str("listen", serverCfg.Listen).
+		Str("protocol", "h2c").
+		Int("max_concurrent_streams", h2cfg.MaxConcurrentStreams).
+		Msg("HTTP/2 prior-knowledge and upgrade (h2c) attached to plaintext listener")
+
+	return h2s.Wrap(ln)
+}
+
+// wrapGroupH2C 为明文监听分组启用 h2c 嗅探与升级握手。
+//
+// 与 attachHTTP2 一致取分组内首个满足条件的虚拟主机：h2c 是连接级协议，
+// 连接上后续请求按 Host 头由分组处理器分流，无需每虚拟主机一个嗅探器。
+// 已配置 TLS 的分组直接返回原监听器（明文嗅探不适用于 TLS 端口）。
+//
+// 参数：
+//   - ln: 分组创建好的原始监听器
+//   - group: 共享该监听器的虚拟主机分组
+//   - fastSrv: 该分组的 fasthttp.Server（用于判断是否已配置 TLS）
+//   - handler: 该分组的组合请求处理器
+//
+// 返回值：
+//   - net.Listener: 供 fasthttp.Server.Serve 使用的监听器
+func (s *Server) wrapGroupH2C(ln net.Listener, group listenGroup, fastSrv *fasthttp.Server, handler fasthttp.RequestHandler) net.Listener {
+	if fastSrv != nil && fastSrv.TLSConfig != nil {
+		return ln
+	}
+	for _, idx := range group.indices {
+		serverCfg := &s.config.Servers[idx]
+		if serverCfg.SSL.HTTP2.Enabled && serverCfg.SSL.HTTP2.H2CEnabled {
+			return s.wrapH2C(fastSrv, ln, serverCfg, handler)
+		}
+	}
+	return ln
+}
+
+// warnHTTP2H2CConfig 提示 h2c 相关的无效配置组合。
+//
+// h2c_enabled 只在明文监听器上、且 ssl.http2.enabled 为 true 时才生效；
+// 校验层只能判断"无 SSL 时是否放行 enabled"，无法感知监听器与虚拟主机的
+// 组合，因此这类"配了但不生效"的情形在启动阶段告警。
+func (s *Server) warnHTTP2H2CConfig() {
+	for i := range s.config.Servers {
+		serverCfg := &s.config.Servers[i]
+		h2cfg := &serverCfg.SSL.HTTP2
+		if !h2cfg.H2CEnabled {
+			continue
+		}
+		if !h2cfg.Enabled {
+			logging.Warn().
+				Str("server", serverCfg.Name).
+				Msg("ssl.http2.h2c_enabled requires ssl.http2.enabled: ignored")
+			continue
+		}
+		if serverCfg.UsesTLS() {
+			logging.Warn().
+				Str("server", serverCfg.Name).
+				Msg("ssl.http2.h2c_enabled only applies to plaintext listeners: use ALPN on this TLS listener")
+		}
+	}
 }

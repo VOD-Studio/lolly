@@ -156,7 +156,7 @@ func TestListenGroupSelectsCertificateBySNI(t *testing.T) {
 		{Name: "a.example", Listen: ":443", SSL: config.SSLConfig{Cert: certA, Key: keyA}},
 		{Name: "b.example", Listen: ":443", SSL: config.SSLConfig{Cert: certB, Key: keyB}},
 	}})
-	fastSrv, err := srv.buildListenGroupServer(listenGroup{listen: ":443", indices: []int{0, 1}})
+	fastSrv, _, err := srv.buildListenGroupServer(listenGroup{listen: ":443", indices: []int{0, 1}})
 	if err != nil {
 		t.Fatal(err)
 	}

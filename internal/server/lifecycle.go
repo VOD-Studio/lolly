@@ -77,10 +77,32 @@ func (s *Server) cleanupResourcesOnce() {
 		s.certMonitor.Stop()
 	}
 
+	// 停止 h2c 嗅探分派：取消在役 HTTP/2 连接
+	s.stopH2CServers()
+
 	// 关闭 Lua 引擎
 	if s.luaEngine != nil {
 		s.luaEngine.Close()
 		logging.Info().Msg("Lua engine closed")
+	}
+}
+
+// stopH2CServers 停止所有明文 HTTP/2（h2c）分派服务器。
+//
+// h2c 连接由 http2.Server 自行服务，不在 fasthttp.Server.Shutdown 的
+// 管辖内，需单独停止：取消连接上下文并关闭连接池，随后等待在役连接收尾。
+// 与 HTTP/3 的停止方式一致采用同步调用，避免后台 goroutine 在测试或下一次
+// logging.Init 之后继续写全局日志器。
+func (s *Server) stopH2CServers() {
+	s.h2cServersMu.Lock()
+	servers := s.h2cServers
+	s.h2cServers = nil
+	s.h2cServersMu.Unlock()
+
+	for _, h2s := range servers {
+		if err := h2s.Stop(); err != nil {
+			logging.Warn().Err(err).Msg("Failed to stop h2c server")
+		}
 	}
 }
 
