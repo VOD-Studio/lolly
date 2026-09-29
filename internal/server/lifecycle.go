@@ -21,6 +21,11 @@ import (
 // 停止 Goroutine 池、健康检查器，关闭访问日志、TLS 管理器、
 // AccessControl 和 Lua 引擎。由 StopWithTimeout 和 GracefulStop 共用。
 func (s *Server) cleanupResources() {
+	s.cleanupOnce.Do(s.cleanupResourcesOnce)
+}
+
+// cleanupResourcesOnce 执行一次服务器资源释放，保证启动失败后仍可安全调用 Stop。
+func (s *Server) cleanupResourcesOnce() {
 	// 停止 Goroutine 池
 	if s.pool != nil {
 		s.pool.Stop()

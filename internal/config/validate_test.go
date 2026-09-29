@@ -1830,6 +1830,16 @@ func TestValidateListenGroups(t *testing.T) {
 			wantErr: "single 模式必须恰好配置一个 server",
 		},
 		{
+			name:    "vhost模式至少需要两个服务器",
+			cfg:     &Config{Mode: ServerModeVHost, Servers: []ServerConfig{{Listen: ":80"}}},
+			wantErr: "vhost 模式至少需要配置两个 server",
+		},
+		{
+			name:    "multi_server模式至少需要两个服务器",
+			cfg:     &Config{Mode: ServerModeMultiServer, Servers: []ServerConfig{{Listen: ":80"}}},
+			wantErr: "multi_server 模式至少需要配置两个 server",
+		},
+		{
 			name: "vhost模式只能使用一个监听地址",
 			cfg: &Config{Mode: ServerModeVHost, Servers: []ServerConfig{
 				{Listen: ":80"}, {Listen: ":81"},

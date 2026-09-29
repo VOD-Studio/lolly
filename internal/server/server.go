@@ -97,6 +97,7 @@ type Server struct {
 	bytesSent           atomic.Int64
 	bytesReceived       atomic.Int64
 	running             atomic.Bool
+	cleanupOnce         sync.Once
 }
 
 // New 创建 HTTP 服务器实例。
@@ -296,6 +297,18 @@ func (s *Server) GetHandler() fasthttp.RequestHandler {
 //   - 调用前需确保配置已正确加载
 //   - Goroutine池和文件缓存根据配置自动启用
 func (s *Server) Start() error {
+	err := s.start()
+	if err != nil {
+		s.cleanupResources()
+	}
+	return err
+}
+
+// start 执行服务器初始化与阻塞服务，失败清理由 Start 统一处理。
+//
+// 返回值：
+//   - error: 初始化、绑定或服务阶段发生的错误
+func (s *Server) start() error {
 	if s.config == nil {
 		return fmt.Errorf("server config is nil")
 	}
@@ -308,8 +321,8 @@ func (s *Server) Start() error {
 	s.startTime = time.Now()
 
 	// 初始化 ACME 自动证书管理器（须在注册路由与创建 TLS 之前）
-	if err := s.initACMEManagers(); err != nil {
-		return err
+	if initErr := s.initACMEManagers(); initErr != nil {
+		return initErr
 	}
 
 	// 启动 ACME 证书到期监控
@@ -322,8 +335,8 @@ func (s *Server) Start() error {
 	s.fileCache = initFileCache(&s.config.Performance)
 
 	// 初始化错误页面管理器
-	var err error
 	if len(s.config.Servers) > 0 {
+		var err error
 		s.errorPageManager, err = initErrorPageManager(&s.config.Servers[0].Security.ErrorPage)
 		if err != nil {
 			return err
@@ -627,111 +640,6 @@ func (s *Server) startSingleMode() error {
 	return s.startServer(0, serverCfg, s.fastServer)
 }
 
-// startVHostMode 虚拟主机模式启动。
-//
-// 在虚拟主机模式下，为每个配置的服务器创建独立的路由器和中间件链，
-// 通过虚拟主机管理器根据 Host 头分发请求。
-//
-// 返回值：
-//   - error: 启动过程中遇到的错误
-//
-// 注意事项：
-//   - 每个虚拟主机有独立的中间件配置
-//   - 未匹配的 Host 头请求由默认主机处理
-func (s *Server) startVHostMode() error {
-	vhostMgr := NewVHostManager()
-
-	for i := range s.config.Servers {
-		router := handler.NewRouter()
-		s.registerProxyRoutes(router, &s.config.Servers[i])
-
-		// 静态文件
-		s.registerStaticHandlers(router, &s.config.Servers[i])
-
-		// ACME http-01 挑战路由
-		s.registerACMEChallengeRouter(router)
-
-		// 为每个虚拟主机构建独立的中间件链
-		chain, err := s.buildMiddlewareChain(&s.config.Servers[i])
-		if err != nil {
-			return err
-		}
-
-		handler := chain.Apply(router.Handler())
-		if s.pool != nil {
-			handler = s.pool.WrapHandler(handler)
-		}
-
-		// 注册 server_names 数组中的所有主机名
-		for _, name := range s.config.Servers[i].EffectiveServerNames() {
-			if err := vhostMgr.AddHost(name, handler); err != nil {
-				return fmt.Errorf("add host %s: %w", name, err)
-			}
-		}
-	}
-
-	// 默认主机
-	defaultSrv := s.config.GetDefaultServerFromList()
-	if defaultSrv != nil {
-		router := handler.NewRouter()
-
-		s.registerMonitoringEndpoints(router, defaultSrv, true)
-
-		s.registerProxyRoutes(router, defaultSrv)
-
-		// 静态文件
-		s.registerStaticHandlers(router, defaultSrv)
-
-		// ACME http-01 挑战路由
-		s.registerACMEChallengeRouter(router)
-
-		chain, err := s.buildMiddlewareChain(defaultSrv)
-		if err != nil {
-			return err
-		}
-
-		handler := chain.Apply(router.Handler())
-		if s.pool != nil {
-			handler = s.pool.WrapHandler(handler)
-		}
-		vhostMgr.SetDefault(handler)
-	}
-
-	s.handler = vhostMgr.Handler()
-	// 包装统计追踪
-	s.handler = s.trackStats(s.handler)
-
-	// 使用 Servers[0] 配置（迁移后 Server 字段为空）
-	serverCfg := &s.config.Servers[0]
-
-	s.fastServer = s.createFastServer(serverCfg, s.handler)
-
-	// 按 SNI 为每个虚拟主机选择独立证书。defaultIdx 指定未匹配任何
-	// server_name 时使用哪个虚拟主机的证书作为兜底。
-	defaultIdx := -1
-	for i := range s.config.Servers {
-		if s.config.Servers[i].Default {
-			defaultIdx = i
-			break
-		}
-	}
-	sniMgr, err := ssl.BuildSNIManager(s.config.Servers, defaultIdx, ssl.WithSNIACMEManagers(s.acmeManagerMap()))
-	if err != nil {
-		return fmt.Errorf("failed to build SNI manager: %w", err)
-	}
-	if sniMgr != nil {
-		s.fastServer.TLSConfig = sniMgr.TLSConfig()
-
-		s.tlsManagersMu.Lock()
-		s.sniManagers = append(s.sniManagers, sniMgr)
-		s.tlsManagersMu.Unlock()
-	}
-
-	s.running.Store(true)
-
-	return s.startServer(0, serverCfg, s.fastServer)
-}
-
 // startMultiServerMode 按监听地址分组启动多个服务器。
 //
 // 同一 listen 的配置共享一个监听器和 fasthttp.Server，并在组内按 Host
@@ -771,25 +679,35 @@ func (s *Server) startMultiServerMode() error {
 			return fastSrv.Serve(ln)
 		}
 	}
-	return serveListenGroups(serve)
+	return serveListenGroups(serve, func() {
+		for i := range s.fastServers {
+			_ = s.fastServers[i].Shutdown()
+		}
+		s.closeActiveListeners()
+	})
 }
 
 // serveListenGroups 并行运行监听分组并返回首个服务错误。
 //
 // 参数：
 //   - serve: 每个监听分组的阻塞服务函数
+//   - stop: 首次出现服务错误时停止其余分组
 //
 // 返回值：
 //   - error: 所有非 nil 服务错误的聚合，全部正常结束时为 nil
-func serveListenGroups(serve []func() error) error {
+func serveListenGroups(serve []func() error, stop func()) error {
 	errCh := make(chan error, len(serve))
-	var wg sync.WaitGroup
+	var (
+		wg       sync.WaitGroup
+		stopOnce sync.Once
+	)
 	for i := range serve {
 		wg.Add(1)
 		go func(run func() error) {
 			defer wg.Done()
 			if err := run(); err != nil {
 				errCh <- err
+				stopOnce.Do(stop)
 			}
 		}(serve[i])
 	}

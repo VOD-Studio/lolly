@@ -114,13 +114,20 @@ func validateModeConstraints(cfg *Config) error {
 			return errors.New("single 模式必须恰好配置一个 server")
 		}
 	case ServerModeVHost:
+		if len(cfg.Servers) < 2 {
+			return errors.New("vhost 模式至少需要配置两个 server")
+		}
 		listen := cfg.Servers[0].Listen
 		for i := 1; i < len(cfg.Servers); i++ {
 			if cfg.Servers[i].Listen != listen {
 				return errors.New("vhost 模式只能使用一个 listen 地址")
 			}
 		}
-	case ServerModeMultiServer, ServerModeAuto, "":
+	case ServerModeMultiServer:
+		if len(cfg.Servers) < 2 {
+			return errors.New("multi_server 模式至少需要配置两个 server")
+		}
+	case ServerModeAuto, "":
 	}
 	return nil
 }

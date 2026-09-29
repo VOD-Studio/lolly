@@ -166,22 +166,6 @@ func (s *Server) acmeManagerAt(idx int) *ssl.ACMEManager {
 	return s.acmeManagers[idx]
 }
 
-// acmeManagerMap 返回"服务器索引 → ACME 管理器"的映射。
-//
-// 仅包含启用 ACME 的服务器，供 SNI 管理器按索引取用。
-//
-// 返回值：
-//   - map[int]*ssl.ACMEManager: 索引到 ACME 管理器的映射
-func (s *Server) acmeManagerMap() map[int]*ssl.ACMEManager {
-	out := make(map[int]*ssl.ACMEManager, len(s.acmeManagers))
-	for i, mgr := range s.acmeManagers {
-		if mgr != nil {
-			out[i] = mgr
-		}
-	}
-	return out
-}
-
 // acmeChallengeHandler 返回处理 ACME http-01 挑战的请求处理器。
 //
 // 收集所有启用 http-01 的 ACME 管理器，按请求 Host 分派到对应管理器：

@@ -1395,10 +1395,10 @@ func TestStartVHostMode_ModeDetection(t *testing.T) {
 	}
 }
 
-// TestStartVHostMode_StartIntegration 测试 startVHostMode 启动集成。
+// TestGroupedVHostStartIntegration 测试 分组虚拟主机启动集成。
 
-// TestStartVHostMode_VHostManagerCreation 测试 VHostManager 创建逻辑。
-func TestStartVHostMode_VHostManagerCreation(t *testing.T) {
+// TestGroupedVHostManagerCreation 测试 VHostManager 创建逻辑。
+func TestGroupedVHostManagerCreation(t *testing.T) {
 	manager := NewVHostManager()
 
 	// 添加多个虚拟主机
@@ -1690,7 +1690,7 @@ func TestStartVHostMode_DefaultHostSetup(t *testing.T) {
 func TestStartVHostMode_MultiServerNames(t *testing.T) {
 	manager := NewVHostManager()
 
-	// 模拟 startVHostMode 中的主机注册逻辑
+	// 模拟 监听分组中的主机注册逻辑
 	serverNames := []string{"example.com", "www.example.com", "example.org"}
 	for _, name := range serverNames {
 		if err := manager.AddHost(name, mockHandler(name, new(bool))); err != nil {
@@ -1756,8 +1756,8 @@ func TestStartVHostMode_ComplexWildcardSetup(t *testing.T) {
 	}
 }
 
-// TestStartVHostMode_ActualExecution 测试 startVHostMode 实际执行路径。
-func TestStartVHostMode_ActualExecution(t *testing.T) {
+// TestGroupedVHostActualExecution 测试 分组虚拟主机实际执行路径。
+func TestGroupedVHostActualExecution(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping integration test in short mode")
 	}
@@ -2114,8 +2114,8 @@ func TestStartVHostMode_MixedProxyAndStatic(t *testing.T) {
 	}
 }
 
-// TestStartVHostMode_ActualServerStart 测试 startVHostMode 实际服务器启动。
-func TestStartVHostMode_ActualServerStart(t *testing.T) {
+// TestGroupedVHostActualServerStart 测试 分组虚拟主机实际服务器启动。
+func TestGroupedVHostActualServerStart(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping integration test in short mode")
 	}
