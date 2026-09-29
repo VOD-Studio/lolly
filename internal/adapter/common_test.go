@@ -400,3 +400,30 @@ func TestStreamRequestBodyEnforcesMaxBodySize(t *testing.T) {
 		t.Fatalf("expected 413, got %d", ctx.Response.StatusCode())
 	}
 }
+
+// TestStreamRequestBodyZeroIsUnlimited 测试 MaxBodySize 为 0 时不限制请求体大小。
+//
+// 配置 0 时，超过任何隐含上限的请求体都应被完整读入，不返回 413。
+func TestStreamRequestBodyZeroIsUnlimited(t *testing.T) {
+	a := NewCommonAdapter()
+	a.MaxBodySize = 0 // 0 表示不限制
+
+	// 2MB，远超此前 <=0 兜底的 1MB 默认值
+	bodyBytes := bytes.Repeat([]byte("a"), 2*1024*1024)
+	ctx := &fasthttp.RequestCtx{}
+	body := bytes.NewReader(bodyBytes)
+	r := &http.Request{
+		Body:          io.NopCloser(body),
+		ContentLength: int64(body.Len()),
+	}
+
+	if err := a.StreamRequestBody(r, ctx); err != nil {
+		t.Fatalf("unlimited 模式不应报错: %v", err)
+	}
+	if ctx.Response.StatusCode() == fasthttp.StatusRequestEntityTooLarge {
+		t.Fatalf("unlimited 模式不应返回 413")
+	}
+	if !bytes.Equal(ctx.Request.Body(), bodyBytes) {
+		t.Fatalf("请求体未被完整读入: got %d bytes, want %d", len(ctx.Request.Body()), len(bodyBytes))
+	}
+}

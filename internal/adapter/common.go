@@ -52,7 +52,7 @@ type CommonAdapter struct {
 	// 每个协议适配器实例独立维护自己的 ctxPool
 	CtxPool sync.Pool
 
-	// MaxBodySize 限制允许读取的请求体最大字节数（<=0 表示不限制）
+	// MaxBodySize 限制允许读取的请求体最大字节数（0 表示不限制，与 nginx 语义一致）
 	MaxBodySize int64
 }
 
@@ -94,7 +94,8 @@ func (a *CommonAdapter) ResetContext(ctx *fasthttp.RequestCtx) {
 //
 // 对于小于等于 DefaultBodyThreshold（64KB）的请求体，直接读取到内存；
 // 对于大于阈值的请求体，使用共享 bufferPool 进行流式处理，避免内存峰值。
-// 超过 MaxBodySize 的请求体会被拒绝并返回 413 错误。
+// 超过 MaxBodySize 的请求体会被拒绝并返回 413 错误；
+// MaxBodySize 为 0 时不限制请求体大小（与 nginx client_max_body_size 0 语义一致）。
 //
 // 参数：
 //   - r: 标准库的 HTTP 请求
@@ -112,25 +113,28 @@ func (a *CommonAdapter) StreamRequestBody(r *http.Request, ctx *fasthttp.Request
 	}()
 
 	limit := a.MaxBodySize
-	if limit <= 0 {
-		limit = 1 << 20 // 1MB default when unset
-	}
+	// 0 表示不限制请求体大小，跳过 Content-Length 预检和硬上限。
+	unlimited := limit == 0
 
 	// Reject early via Content-Length when possible.
-	if r.ContentLength > 0 && r.ContentLength > limit {
+	if !unlimited && r.ContentLength > 0 && r.ContentLength > limit {
 		ctx.Error("Request Entity Too Large", fasthttp.StatusRequestEntityTooLarge)
 		return fmt.Errorf("request body %d exceeds limit %d", r.ContentLength, limit)
 	}
 
-	// Stream with a hard cap so chunked/unknown-length bodies cannot OOM us.
-	limitedBody := io.LimitReader(r.Body, limit+1)
+	// 限制模式下用 LimitReader 设硬上限，防止 chunked/未知长度请求体 OOM；
+	// 不限制模式直接读原始流。
+	bodyReader := io.Reader(r.Body)
+	if !unlimited {
+		bodyReader = io.LimitReader(r.Body, limit+1)
+	}
 
 	if r.ContentLength > 0 && r.ContentLength <= DefaultBodyThreshold {
-		body, err := io.ReadAll(limitedBody)
+		body, err := io.ReadAll(bodyReader)
 		if err != nil {
 			return err
 		}
-		if int64(len(body)) > limit {
+		if !unlimited && int64(len(body)) > limit {
 			ctx.Error("Request Entity Too Large", fasthttp.StatusRequestEntityTooLarge)
 			return fmt.Errorf("request body exceeds limit %d", limit)
 		}
@@ -153,7 +157,7 @@ func (a *CommonAdapter) StreamRequestBody(r *http.Request, ctx *fasthttp.Request
 
 	var total int64
 	for {
-		n, err := limitedBody.Read(buf)
+		n, err := bodyReader.Read(buf)
 		if n > 0 {
 			body = append(body, buf[:n]...)
 			total += int64(n)
@@ -164,7 +168,7 @@ func (a *CommonAdapter) StreamRequestBody(r *http.Request, ctx *fasthttp.Request
 		if err != nil {
 			return err
 		}
-		if total > limit {
+		if !unlimited && total > limit {
 			ctx.Error("Request Entity Too Large", fasthttp.StatusRequestEntityTooLarge)
 			return fmt.Errorf("request body exceeds limit %d", limit)
 		}
