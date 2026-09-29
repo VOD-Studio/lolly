@@ -14,6 +14,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/base64"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -243,6 +244,21 @@ func TestSniffedConnPreservesSocketFeatures(t *testing.T) {
 	if _, ok := interface{}(wrapped).(io.ReaderFrom); !ok {
 		t.Error("包装连接应实现 io.ReaderFrom 以保留零拷贝发送")
 	}
+
+	counter := &perIPConnCounter{}
+	if !counter.acquire("127.0.0.1", 1) {
+		t.Fatal("首次连接额度占用失败")
+	}
+	counted := &countedConn{Conn: wrapped, counter: counter, ip: "127.0.0.1"}
+	if counted.UnderlyingConn() != server {
+		t.Error("嵌套包装应返回最内层原始连接")
+	}
+	if err := counted.SetKeepAlive(true); err != nil {
+		t.Errorf("计数包装 SetKeepAlive() error: %v", err)
+	}
+	if _, ok := interface{}(counted).(io.ReaderFrom); !ok {
+		t.Error("计数包装应实现 io.ReaderFrom 以保留零拷贝发送")
+	}
 }
 
 // TestSniffedConnIgnoresUnsupportedKeepAlive 验证底层连接不支持 keepalive 时
@@ -353,6 +369,76 @@ func TestWrapServesH2CAndHTTP1(t *testing.T) {
 			t.Errorf("响应体不匹配: %q", string(body))
 		}
 	})
+}
+
+// TestWrapSharesMaxConnsPerIP 验证 HTTP/1.1 与 h2c 在嗅探前共用每 IP 连接额度，
+// 且连接关闭后额度会被释放。
+func TestWrapSharesMaxConnsPerIP(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	h2s, err := NewServer(h2cTestConfig(), echoHandler("limited"), nil, WithMaxConnsPerIP(1))
+	if err != nil {
+		t.Fatalf("NewServer() error: %v", err)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() error: %v", err)
+	}
+	wrapped := h2s.Wrap(ln)
+	fastSrv := &fasthttp.Server{Handler: echoHandler("limited")}
+	go func() { _ = fastSrv.Serve(wrapped) }()
+	defer func() {
+		_ = h2s.Stop()
+		_ = fastSrv.Shutdown()
+		_ = ln.Close()
+	}()
+
+	first, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("Dial() error: %v", err)
+	}
+	if _, err := first.Write([]byte("GET / HTTP/1.1\r\nHost: example\r\n")); err != nil {
+		t.Fatalf("写入 HTTP/1.1 请求头失败: %v", err)
+	}
+
+	second, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("Dial() error: %v", err)
+	}
+	if _, err := second.Write(clientPreface()); err != nil {
+		t.Fatalf("写入 h2c 前导失败: %v", err)
+	}
+	_ = second.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := second.Read(make([]byte, 1)); err == nil {
+		t.Error("HTTP/1.1 占用额度后，同 IP 的 h2c 连接应被关闭")
+	}
+	_ = second.Close()
+	_ = first.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		third, dialErr := net.Dial("tcp", ln.Addr().String())
+		if dialErr != nil {
+			t.Fatalf("Dial() error: %v", dialErr)
+		}
+		if _, writeErr := third.Write([]byte("GET / HTTP/1.1\r\nHost: example\r\nConnection: close\r\n\r\n")); writeErr == nil {
+			_ = third.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+			resp, readErr := http.ReadResponse(bufio.NewReader(third), nil)
+			if readErr == nil {
+				_ = resp.Body.Close()
+				_ = third.Close()
+				break
+			}
+		}
+		_ = third.Close()
+		if time.Now().After(deadline) {
+			t.Fatal("连接关闭后每 IP 额度未释放")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // TestWrapRespectsMaxConcurrentConns 验证 h2c 连接数上限：超出额度的连接
@@ -579,6 +665,149 @@ func TestUpgradeHandshakeServesUpgradedRequest(t *testing.T) {
 	}
 	if body != "hello-upgrade" {
 		t.Errorf("响应体不匹配: %q", body)
+	}
+}
+
+// TestUpgradeHandshakeWithStreamedBody 验证开启 fasthttp 请求体流式后，升级请求
+// 会先消费完整 body，再把它作为 HTTP/2 流 1 交给处理器。
+func TestUpgradeHandshakeWithStreamedBody(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	bodySeen := make(chan string, 1)
+	handler := func(ctx *fasthttp.RequestCtx) {
+		bodySeen <- string(ctx.Request.Body())
+		ctx.SetStatusCode(fasthttp.StatusOK)
+		ctx.WriteString("streamed-upgrade")
+	}
+	h2s, err := NewServer(h2cTestConfig(), handler, nil)
+	if err != nil {
+		t.Fatalf("NewServer() error: %v", err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() error: %v", err)
+	}
+	fastSrv := &fasthttp.Server{
+		Handler:           h2s.UpgradeHandler(handler),
+		StreamRequestBody: true,
+	}
+	go func() { _ = fastSrv.Serve(h2s.Wrap(ln)) }()
+	defer func() {
+		_ = h2s.Stop()
+		_ = fastSrv.Shutdown()
+		_ = ln.Close()
+	}()
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("Dial() error: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatalf("SetDeadline() error: %v", err)
+	}
+
+	settings := base64.RawURLEncoding.EncodeToString(nil)
+	requestBody := "streamed request body"
+	request := "POST /upload HTTP/1.1\r\n" +
+		"Host: example\r\n" +
+		"Connection: Upgrade, HTTP2-Settings\r\n" +
+		"Upgrade: h2c\r\n" +
+		"HTTP2-Settings: " + settings + "\r\n" +
+		"Content-Length: " + fmt.Sprint(len(requestBody)) + "\r\n" +
+		"\r\n" + requestBody
+	if _, err := conn.Write([]byte(request)); err != nil {
+		t.Fatalf("写入升级请求失败: %v", err)
+	}
+
+	br := bufio.NewReader(conn)
+	statusLine, _ := readHTTP1ResponseHead(t, br)
+	if !strings.Contains(statusLine, "101") {
+		t.Fatalf("流式请求体应允许升级，实际 %q", statusLine)
+	}
+	if _, err := conn.Write([]byte(h2cPreface)); err != nil {
+		t.Fatalf("写入连接前导失败: %v", err)
+	}
+	fr := http2.NewFramer(conn, br)
+	if err := fr.WriteSettings(); err != nil {
+		t.Fatalf("WriteSettings() error: %v", err)
+	}
+
+	select {
+	case got := <-bodySeen:
+		if got != requestBody {
+			t.Errorf("流 1 请求体不匹配: %q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("升级请求未作为流 1 交给处理器")
+	}
+
+	// 等流 1 响应结束再清理服务器，避免关闭连接时仍有异步帧写入。
+	for {
+		frame, err := fr.ReadFrame()
+		if err != nil {
+			t.Fatalf("读取 HTTP/2 响应帧失败: %v", err)
+		}
+		if data, ok := frame.(*http2.DataFrame); ok && data.StreamID == 1 && data.StreamEnded() {
+			break
+		}
+	}
+}
+
+// TestUpgradeHandshakeRejectsOversizedStreamedBody 验证升级请求的流式 body
+// 仍受 HTTP/2 请求体上限约束，超限时返回 413 且不劫持连接。
+func TestUpgradeHandshakeRejectsOversizedStreamedBody(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	cfg := h2cTestConfig()
+	cfg.MaxBodySize = 4
+	h2s, err := NewServer(cfg, echoHandler("unexpected"), nil)
+	if err != nil {
+		t.Fatalf("NewServer() error: %v", err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() error: %v", err)
+	}
+	fastSrv := &fasthttp.Server{
+		Handler:           h2s.UpgradeHandler(echoHandler("unexpected")),
+		StreamRequestBody: true,
+	}
+	go func() { _ = fastSrv.Serve(h2s.Wrap(ln)) }()
+	defer func() {
+		_ = h2s.Stop()
+		_ = fastSrv.Shutdown()
+		_ = ln.Close()
+	}()
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("Dial() error: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	request := "POST /upload HTTP/1.1\r\n" +
+		"Host: example\r\n" +
+		"Connection: Upgrade, HTTP2-Settings\r\n" +
+		"Upgrade: h2c\r\n" +
+		"HTTP2-Settings: \r\n" +
+		"Content-Length: 10\r\n\r\n1234567890"
+	if _, err := conn.Write([]byte(request)); err != nil {
+		t.Fatalf("写入升级请求失败: %v", err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("读取响应失败: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != fasthttp.StatusRequestEntityTooLarge {
+		t.Errorf("期望 413，实际 %d", resp.StatusCode)
+	}
+	if !resp.Close {
+		t.Error("未消费完的超限请求体必须关闭连接")
 	}
 }
 

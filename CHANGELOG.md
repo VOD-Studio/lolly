@@ -26,7 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     劫持连接写 101，被升级的请求按规范作为 HTTP/2 流 1 响应
   - 校验不通过的升级请求退回普通 HTTP/1.1 处理；握手不计入访问日志与中间件
   - 复用 HTTP/2→fasthttp 适配器，请求体上限、流式读取与 ALPN 路径一致
-  - h2c 连接数受 `concurrency` 约束；`max_conns_per_ip` 不适用于多路复用连接
+  - HTTP/1.1 与 prior-knowledge h2c 在协议嗅探前共用 `max_conns_per_ip` 额度，h2c 连接总数同时受 `concurrency` 约束
+  - `Upgrade: h2c` 支持流式入站请求体；握手前临时物化流 1 请求体，升级后的 HTTP/2 请求仍按配置流式处理
   - `h2c_enabled` 与 `enabled`/TLS 监听器搭配无效时启动告警
 
 ## [0.5.0] - 2026-09-28

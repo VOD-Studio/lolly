@@ -12,11 +12,10 @@
 //
 // 注意事项：
 //   - h2c 是明文协议，只应在可信网络（服务间调用、内部负载均衡）启用
-//   - 嗅探命中的 h2c 连接不经过 fasthttp 的 Accept 循环，因此不受 fasthttp 的
-//     max_conns_per_ip 约束（多路复用下单连接即可承载全部请求，该限制语义并不适用）；
-//     连接总数由 WithMaxConcurrentConns 限制
+//   - 嗅探在 fasthttp 的 Accept 循环外完成，因此 Wrap 在协议识别前统一执行
+//     max_conns_per_ip 计数，HTTP/1.1 与 prior-knowledge h2c 共用同一额度
 //   - 升级握手走 fasthttp 的 Hijack，fasthttp 对劫持连接不施加 Concurrency 与
-//     读写超时，因此同样计入连接额度
+//     读写超时，因此同样计入连接总额度
 //
 // 作者：xfy
 package http2
@@ -31,6 +30,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/valyala/fasthttp"
@@ -80,6 +80,152 @@ type keepAliveSetter interface {
 	SetKeepAlivePeriod(d time.Duration) error
 }
 
+// underlyingConnProvider 暴露包装前的连接，供 sendfile 等依赖具体套接字类型的路径使用。
+type underlyingConnProvider interface {
+	UnderlyingConn() net.Conn
+}
+
+// perIPConnCounter 记录当前监听器上各客户端 IP 的连接数。
+//
+// 计数器位于协议嗅探之前，使 HTTP/1.1 与 h2c 使用同一额度。
+type perIPConnCounter struct {
+	mu     sync.Mutex
+	counts map[string]int
+}
+
+// acquire 尝试占用一个 IP 连接额度。
+//
+// 参数：
+//   - ip: 规范化后的客户端 IP
+//   - limit: 每 IP 最大连接数，<=0 表示不限制
+//
+// 返回值：
+//   - bool: true 表示占用成功
+func (c *perIPConnCounter) acquire(ip string, limit int) bool {
+	if limit <= 0 {
+		return true
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.counts == nil {
+		c.counts = make(map[string]int)
+	}
+	if c.counts[ip] >= limit {
+		return false
+	}
+	c.counts[ip]++
+	return true
+}
+
+// release 释放一个 IP 连接额度。
+//
+// 参数：
+//   - ip: 规范化后的客户端 IP
+func (c *perIPConnCounter) release(ip string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.counts[ip] <= 1 {
+		delete(c.counts, ip)
+		return
+	}
+	c.counts[ip]--
+}
+
+// countedConn 在连接关闭时自动归还每 IP 额度。
+type countedConn struct {
+	net.Conn
+	counter *perIPConnCounter
+	ip      string
+	once    sync.Once
+}
+
+// Close 关闭底层连接并确保每 IP 额度只释放一次。
+//
+// 返回值：
+//   - error: 底层连接关闭错误
+func (c *countedConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(func() { c.counter.release(c.ip) })
+	return err
+}
+
+// UnderlyingConn 返回最内层原始连接。
+//
+// 返回值：
+//   - net.Conn: 未带计数包装的连接
+func (c *countedConn) UnderlyingConn() net.Conn {
+	if wrapped, ok := c.Conn.(underlyingConnProvider); ok {
+		return wrapped.UnderlyingConn()
+	}
+	return c.Conn
+}
+
+// SetKeepAlive 把 keepalive 开关转发给底层套接字。
+//
+// 参数：
+//   - keepalive: 是否开启 TCP keepalive
+//
+// 返回值：
+//   - error: 转发失败时返回错误
+func (c *countedConn) SetKeepAlive(keepalive bool) error {
+	if setter, ok := c.Conn.(keepAliveSetter); ok {
+		return setter.SetKeepAlive(keepalive)
+	}
+	return nil
+}
+
+// SetKeepAlivePeriod 把 keepalive 间隔转发给底层套接字。
+//
+// 参数：
+//   - d: keepalive 探测间隔
+//
+// 返回值：
+//   - error: 转发失败时返回错误
+func (c *countedConn) SetKeepAlivePeriod(d time.Duration) error {
+	if setter, ok := c.Conn.(keepAliveSetter); ok {
+		return setter.SetKeepAlivePeriod(d)
+	}
+	return nil
+}
+
+// ReadFrom 转发 io.ReaderFrom，保留明文响应的零拷贝发送路径。
+//
+// 参数：
+//   - r: 数据来源
+//
+// 返回值：
+//   - int64: 写入的字节数
+//   - error: 写入失败时返回错误
+func (c *countedConn) ReadFrom(r io.Reader) (int64, error) {
+	if readerFrom, ok := c.Conn.(io.ReaderFrom); ok {
+		return readerFrom.ReadFrom(r)
+	}
+	return io.Copy(c.Conn, r)
+}
+
+// remoteIP 返回连接远端的规范化 IP；非 IP 地址回退到完整地址文本。
+//
+// 参数：
+//   - conn: 待识别远端地址的连接
+//
+// 返回值：
+//   - string: 用于连接计数的地址键
+func remoteIP(conn net.Conn) string {
+	addr := conn.RemoteAddr()
+	if addr == nil {
+		return ""
+	}
+	if tcpAddr, ok := addr.(*net.TCPAddr); ok {
+		return tcpAddr.IP.String()
+	}
+	host, _, err := net.SplitHostPort(addr.String())
+	if err == nil {
+		return host
+	}
+	return addr.String()
+}
+
 // sniffedConn 包装 net.Conn，使嗅探阶段读走的字节可以被重新读出。
 //
 // fasthttp 与 http2.Server 都从连接首字节开始解析协议，嗅探消耗的前导必须
@@ -117,6 +263,9 @@ func (c *sniffedConn) Read(p []byte) (int, error) {
 // 返回值：
 //   - net.Conn: 原始连接
 func (c *sniffedConn) UnderlyingConn() net.Conn {
+	if wrapped, ok := c.Conn.(underlyingConnProvider); ok {
+		return wrapped.UnderlyingConn()
+	}
 	return c.Conn
 }
 
@@ -288,15 +437,17 @@ func h2cUpgradeSettings(req *fasthttp.Request) (settings []byte, ok bool) {
 // h2cUpgradeRequest 把被升级的 HTTP/1.1 请求转换成 ServeConn 需要的 http.Request。
 //
 // 字段必须逐项复制：ctx 及其请求缓冲区在处理器返回后即被 fasthttp 回收，
-// 而升级出的 HTTP/2 连接会在之后很长时间里继续使用这份请求。
+// 而升级出的 HTTP/2 连接会在之后很长时间里继续使用这份请求。Body() 会在
+// 请求体为流时先完整读取它，保证连接交给 HTTP/2 帧解析器前已消费完 HTTP/1.1 body。
 //
 // 参数：
 //   - ctx: 升级请求上下文
+//   - maxBodySize: 流式请求体最大字节数，<=0 表示不限制
 //
 // 返回值：
 //   - *http.Request: 等价的 HTTP/2 请求（将作为流 1 处理）
-//   - error: 请求 URI 无法解析时返回错误
-func h2cUpgradeRequest(ctx *fasthttp.RequestCtx) (*http.Request, error) {
+//   - error: 请求 URI 无法解析、流式请求体读取失败或超过上限时返回错误
+func h2cUpgradeRequest(ctx *fasthttp.RequestCtx, maxBodySize int64) (*http.Request, error) {
 	target := string(ctx.URI().RequestURI())
 	u, err := url.ParseRequestURI(target)
 	if err != nil {
@@ -324,7 +475,28 @@ func h2cUpgradeRequest(ctx *fasthttp.RequestCtx) (*http.Request, error) {
 		header.Add(name, string(value))
 	}
 
-	body := ctx.Request.Body()
+	var body []byte
+	if ctx.Request.IsBodyStream() {
+		bodyReader := ctx.Request.BodyStream()
+		if limit := maxBodySize; limit > 0 {
+			bodyReader = io.LimitReader(bodyReader, limit+1)
+		}
+		body, err = io.ReadAll(bodyReader)
+		closeErr := ctx.Request.CloseBodyStream()
+		if err != nil {
+			return nil, err
+		}
+		if maxBodySize > 0 && int64(len(body)) > maxBodySize {
+			return nil, fasthttp.ErrBodyTooLarge
+		}
+		if closeErr != nil {
+			return nil, closeErr
+		}
+		ctx.Request.SetBody(body)
+	} else {
+		body = ctx.Request.Body()
+	}
+
 	req := &http.Request{
 		Method:        string(ctx.Request.Header.Method()),
 		URL:           u,
@@ -348,8 +520,8 @@ func h2cUpgradeRequest(ctx *fasthttp.RequestCtx) (*http.Request, error) {
 
 // parseH2CUpgrade 判定并解析当前请求是否为可服务的 h2c 升级请求。
 //
-// 带流式请求体的请求不参与升级：请求体尚未读完时连接里剩下的仍是 HTTP/1.1
-// 字节，无法直接交给 HTTP/2 帧解析器。
+// 流式请求体会在 h2cUpgradeRequest 中先物化；Upgrade 是连接级、一次性的握手，
+// 必须先消费完 HTTP/1.1 body，之后的 HTTP/2 请求仍按配置正常流式处理。
 //
 // 参数：
 //   - ctx: 请求上下文
@@ -357,31 +529,27 @@ func h2cUpgradeRequest(ctx *fasthttp.RequestCtx) (*http.Request, error) {
 // 返回值：
 //   - settings: HTTP2-Settings 携带的 SETTINGS 负载（可为 nil）
 //   - req: 作为流 1 处理的等价请求
-//   - ok: false 表示应按普通 HTTP/1.1 请求处理
-func parseH2CUpgrade(ctx *fasthttp.RequestCtx) (settings []byte, req *http.Request, ok bool) {
+//   - upgrade: false 表示应按普通 HTTP/1.1 请求处理
+//   - error: 合法升级请求的 URI 或请求体读取失败
+func (s *Server) parseH2CUpgrade(ctx *fasthttp.RequestCtx) (settings []byte, req *http.Request, upgrade bool, err error) {
 	settings, valid := h2cUpgradeSettings(&ctx.Request)
 	if !valid {
-		return nil, nil, false
+		return nil, nil, false, nil
 	}
-	if ctx.Request.IsBodyStream() {
-		return nil, nil, false
-	}
-
-	req, err := h2cUpgradeRequest(ctx)
+	req, err = h2cUpgradeRequest(ctx, s.maxBodySize)
 	if err != nil {
-		logging.Warn().Err(err).Msg("HTTP/2 (h2c) upgrade request has an unparsable URI: served as HTTP/1.1")
-		return nil, nil, false
+		return nil, nil, true, err
 	}
 
-	return settings, req, true
+	return settings, req, true, nil
 }
 
 // UpgradeHandler 返回拦截 h2c Upgrade 握手的处理器包装。
 //
 // 非升级请求原样交给 handler；合法的升级请求按 RFC 7540 3.2 把被升级的请求
 // 视为 HTTP/2 的流 1（客户端不会重发它），劫持连接写出 101 响应后在同一连接
-// 上继续按 HTTP/2 服务。校验不通过的升级请求退回普通 HTTP/1.1 处理，与不
-// 支持 h2c 的实现行为一致。
+// 上继续按 HTTP/2 服务。校验不通过的升级请求退回普通 HTTP/1.1 处理，与不支持
+// h2c 的实现行为一致；已确认的升级请求若 URI 或请求体读取失败，则直接返回错误。
 //
 // 该包装应位于处理器链最外层（在中间件之前）：升级握手不是业务请求，
 // 不该计入访问日志、限流或压缩。必须在 fasthttp.Server.Serve 之前替换 Handler，
@@ -394,9 +562,20 @@ func parseH2CUpgrade(ctx *fasthttp.RequestCtx) (settings []byte, req *http.Reque
 //   - fasthttp.RequestHandler: 带 h2c 升级能力的处理器
 func (s *Server) UpgradeHandler(handler fasthttp.RequestHandler) fasthttp.RequestHandler {
 	return func(ctx *fasthttp.RequestCtx) {
-		settings, req, ok := parseH2CUpgrade(ctx)
-		if !ok {
+		settings, req, upgrade, err := s.parseH2CUpgrade(ctx)
+		if !upgrade {
 			handler(ctx)
+			return
+		}
+		if err != nil {
+			if errors.Is(err, fasthttp.ErrBodyTooLarge) {
+				ctx.Error("Request Entity Too Large", fasthttp.StatusRequestEntityTooLarge)
+			} else {
+				ctx.Error("Bad Request", fasthttp.StatusBadRequest)
+			}
+			// 流可能只读到上限或在中途失败，禁止复用连接解析残留 body。
+			ctx.SetConnectionClose()
+			logging.Warn().Err(err).Msg("HTTP/2 (h2c) upgrade request body or URI is invalid")
 			return
 		}
 
@@ -456,6 +635,18 @@ func (l *h2cListener) Accept() (net.Conn, error) {
 		conn, err := l.Listener.Accept()
 		if err != nil {
 			return nil, err
+		}
+
+		ip := remoteIP(conn)
+		if !l.server.perIPConns.acquire(ip, l.server.maxConnsPerIP) {
+			logging.Warn().
+				Str("remote_ip", ip).
+				Msg("connection rejected: max connections per IP reached")
+			_ = conn.Close()
+			continue
+		}
+		if l.server.maxConnsPerIP > 0 {
+			conn = &countedConn{Conn: conn, counter: &l.server.perIPConns, ip: ip}
 		}
 
 		select {

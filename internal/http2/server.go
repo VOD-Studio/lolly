@@ -56,6 +56,8 @@ type Server struct {
 	sniffTimeout            time.Duration
 	maxConns                int
 	activeConns             atomic.Int64
+	maxConnsPerIP           int
+	perIPConns              perIPConnCounter
 	ctx                     context.Context
 	cancel                  context.CancelFunc
 	mu                      sync.RWMutex
@@ -82,6 +84,20 @@ type Option func(*Server)
 //   - Option: 应用该配置的选项
 func WithMaxConcurrentConns(n int) Option {
 	return func(s *Server) { s.maxConns = n }
+}
+
+// WithMaxConnsPerIP 限制 Wrap 模式下同一客户端 IP 的并发连接数。
+//
+// 计数在协议嗅探前完成，因此 HTTP/1.1 与 prior-knowledge h2c 共用同一额度；
+// 外层 fasthttp 必须关闭自身的 MaxConnsPerIP，避免 HTTP/1.1 重复计数。
+//
+// 参数：
+//   - n: 每 IP 最大并发连接数，<=0 表示不限制
+//
+// 返回值：
+//   - Option: 应用该配置的选项
+func WithMaxConnsPerIP(n int) Option {
+	return func(s *Server) { s.maxConnsPerIP = n }
 }
 
 // NewServer 创建 HTTP/2 服务器。

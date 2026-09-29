@@ -130,7 +130,7 @@ docs/config/
 |-----------|-----------|
 | WebSocket 代理 | ✓ 自动协议升级 |
 | HTTP/2 | ✓ `ssl.http2.enabled`（TLS 上经 ALPN 协商） |
-| HTTP/2 明文（h2c） | ✓ `ssl.http2.h2c_enabled`（prior knowledge 与 Upgrade 握手） |
+| HTTP/2 明文（h2c） | ✓ `ssl.http2.h2c_enabled`（prior knowledge 与 Upgrade 握手；与 HTTP/1.1 共用 `max_conns_per_ip`；Upgrade 的流 1 请求体会在握手前缓冲） |
 | HTTP/3 (QUIC) | ✓ `http3.enabled` |
 | TCP/UDP Stream | ✓ `stream` 配置 |
 | URL 重写 | ✓ `rewrite` 配置 |

@@ -1092,9 +1092,9 @@ func (s *Server) prepareHTTP2Config(serverCfg *config.ServerConfig) *config.HTTP
 //
 // TLS 监听器的协议分派由 ALPN 负责（见 attachHTTP2），此处不介入。
 //
-// 已知边界：h2c 连接不经过 fasthttp 的 Accept 循环，不受 max_conns_per_ip
-// 约束（多路复用下单连接即可承载全部请求，该限制语义不适用），连接总数
-// 用 serverCfg.Concurrency 约束，避免嗅探分派成为无界 goroutine 来源。
+// h2c 启用后由包装监听器在协议嗅探前统一执行 max_conns_per_ip，确保
+// HTTP/1.1 与 prior-knowledge h2c 共用同一 IP 额度；fasthttp 自身的同名限制
+// 随后关闭以避免 HTTP/1.1 重复计数。连接总数仍用 serverCfg.Concurrency 约束。
 //
 // 必须在 fastSrv 启动前调用：升级握手要包住整个处理器链，因此会就地替换
 // fastSrv.Handler，让握手不经过中间件、不计入访问日志与限流。
@@ -1116,12 +1116,24 @@ func (s *Server) wrapH2C(fastSrv *fasthttp.Server, ln net.Listener, serverCfg *c
 		return ln
 	}
 
-	h2s, err := http2.NewServer(h2cfg, handler, nil, http2.WithMaxConcurrentConns(serverCfg.Concurrency))
+	h2s, err := http2.NewServer(
+		h2cfg,
+		handler,
+		nil,
+		http2.WithMaxConcurrentConns(serverCfg.Concurrency),
+		http2.WithMaxConnsPerIP(serverCfg.MaxConnsPerIP),
+	)
 	if err != nil {
 		logging.Error().Err(err).Msg("Failed to create h2c server")
 		return ln
 	}
 
+	// 包装监听器已在协议嗅探前统一计数，fasthttp 不再重复登记 HTTP/1.1。
+	fastSrv.MaxConnsPerIP = 0
+	// h2c Upgrade 的流 1 先由 fasthttp 读取，需与 HTTP/2 适配器使用同一上限。
+	if h2cfg.MaxBodySize > 0 && h2cfg.MaxBodySize <= int64(^uint(0)>>1) {
+		fastSrv.MaxRequestBodySize = int(h2cfg.MaxBodySize)
+	}
 	// 升级握手放在处理器链最外层：被升级的请求不该走一遍业务中间件。
 	fastSrv.Handler = h2s.UpgradeHandler(handler)
 
