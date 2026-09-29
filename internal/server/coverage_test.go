@@ -589,6 +589,59 @@ func TestIsAnyAddr(t *testing.T) {
 	}
 }
 
+// TestCreateFastServer_StreamRequestBody 测试请求体流式开关透传。
+func TestCreateFastServer_StreamRequestBody(t *testing.T) {
+	s := &Server{}
+	serverCfg := &config.ServerConfig{}
+
+	if srv := s.createFastServer(serverCfg, nil, false); srv.StreamRequestBody {
+		t.Error("StreamRequestBody should be false when flag is false")
+	}
+	if srv := s.createFastServer(serverCfg, nil, true); !srv.StreamRequestBody {
+		t.Error("StreamRequestBody should be true when flag is true")
+	}
+}
+
+// TestAnyProxyRequestStreaming 测试监听分组请求体流式检测。
+func TestAnyProxyRequestStreaming(t *testing.T) {
+	withStreaming := func() *config.ServerConfig {
+		return &config.ServerConfig{
+			Proxy: []config.ProxyConfig{{
+				Path: "/",
+				Targets: []config.ProxyTarget{{URL: "http://127.0.0.1:8080"}},
+				Buffering: &config.ProxyBufferingConfig{RequestMode: "off"},
+			}},
+		}
+	}
+	withoutStreaming := func() *config.ServerConfig {
+		return &config.ServerConfig{
+			Proxy: []config.ProxyConfig{{
+				Path: "/",
+				Targets: []config.ProxyTarget{{URL: "http://127.0.0.1:8080"}},
+				Buffering: &config.ProxyBufferingConfig{Mode: "off"},
+			}},
+		}
+	}
+
+	tests := []struct {
+		name    string
+		servers []*config.ServerConfig
+		want    bool
+	}{
+		{name: "nil cfg", servers: []*config.ServerConfig{{}}, want: false},
+		{name: "no streaming", servers: []*config.ServerConfig{withoutStreaming()}, want: false},
+		{name: "streaming", servers: []*config.ServerConfig{withStreaming()}, want: true},
+		{name: "mixed", servers: []*config.ServerConfig{withoutStreaming(), withStreaming()}, want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := anyProxyRequestStreaming(tt.servers...); got != tt.want {
+				t.Errorf("anyProxyRequestStreaming() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 // TestCreateFastServer 测试创建 fasthttp 服务器。
 func TestCreateFastServer(t *testing.T) {
 	s := &Server{}
@@ -605,7 +658,7 @@ func TestCreateFastServer(t *testing.T) {
 	}
 
 	handler := func(ctx *fasthttp.RequestCtx) {}
-	fastSrv := s.createFastServer(serverCfg, handler)
+	fastSrv := s.createFastServer(serverCfg, handler, false)
 
 	assert.NotNil(t, fastSrv)
 	assert.Equal(t, 10*time.Second, fastSrv.ReadTimeout)
@@ -626,7 +679,7 @@ func TestCreateFastServer_隐藏版本(t *testing.T) {
 		ServerTokens: false,
 	}
 
-	fastSrv := s.createFastServer(serverCfg, nil)
+	fastSrv := s.createFastServer(serverCfg, nil, false)
 	assert.Equal(t, "lolly", fastSrv.Name)
 }
 

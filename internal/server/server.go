@@ -169,14 +169,18 @@ func (s *Server) getServerName(cfg *config.ServerConfig) string {
 // createFastServer 创建 fasthttp.Server 实例。
 //
 // 根据配置创建并配置 fasthttp.Server，包含所有通用设置。
+// 当 streamRequestBody 为 true 时，开启请求体流式读取，
+// 使 ctx.Request.BodyStream() 直接从连接读取，供代理层
+// 实现请求体流式转发（buffering.request_mode: off）。
 //
 // 参数：
 //   - serverCfg: 服务器配置对象
 //   - handler: 请求处理器
+//   - streamRequestBody: 是否开启请求体流式读取
 //
 // 返回值：
 //   - *fasthttp.Server: 配置好的 fasthttp.Server 实例
-func (s *Server) createFastServer(serverCfg *config.ServerConfig, handler fasthttp.RequestHandler) *fasthttp.Server {
+func (s *Server) createFastServer(serverCfg *config.ServerConfig, handler fasthttp.RequestHandler, streamRequestBody bool) *fasthttp.Server {
 	return &fasthttp.Server{
 		Name:               s.getServerName(serverCfg),
 		Handler:            handler,
@@ -190,7 +194,33 @@ func (s *Server) createFastServer(serverCfg *config.ServerConfig, handler fastht
 		ReadBufferSize:     serverCfg.ReadBufferSize,
 		WriteBufferSize:    serverCfg.WriteBufferSize,
 		ReduceMemoryUsage:  serverCfg.ReduceMemoryUsage,
+		StreamRequestBody:  streamRequestBody,
 	}
+}
+
+// anyProxyRequestStreaming 报告给定服务器配置中是否有任一代理启用了请求体流式。
+//
+// 用于决定共享监听器的 fasthttp.Server 是否开启 StreamRequestBody。
+// 只要组内任一 location 的 proxy 配置了 buffering.request_mode: off，
+// 整个监听器就启用流式读取（server 级开关无法按 location 切换）。
+//
+// 参数：
+//   - servers: 同一监听分组的所有服务器配置
+//
+// 返回值：
+//   - bool: true 表示至少有一个代理启用了请求体流式
+func anyProxyRequestStreaming(servers ...*config.ServerConfig) bool {
+	for _, sc := range servers {
+		if sc == nil {
+			continue
+		}
+		for i := range sc.Proxy {
+			if sc.Proxy[i].Buffering.RequestStreamingEnabled() {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // applyTypesConfig 应用 MIME 类型配置。
@@ -633,7 +663,7 @@ func (s *Server) startSingleMode() error {
 	}
 	s.handler = handler
 
-	s.fastServer = s.createFastServer(serverCfg, s.handler)
+	s.fastServer = s.createFastServer(serverCfg, s.handler, anyProxyRequestStreaming(serverCfg))
 
 	s.running.Store(true)
 
@@ -779,7 +809,14 @@ func (s *Server) buildListenGroupServer(group listenGroup) (*fasthttp.Server, er
 	}
 
 	representative := &s.config.Servers[group.indices[0]]
-	fastSrv := s.createFastServer(representative, vhosts.Handler())
+	streamReqBody := false
+	for _, idx := range group.indices {
+		if anyProxyRequestStreaming(&s.config.Servers[idx]) {
+			streamReqBody = true
+			break
+		}
+	}
+	fastSrv := s.createFastServer(representative, vhosts.Handler(), streamReqBody)
 	if !representative.UsesTLS() {
 		return fastSrv, nil
 	}
