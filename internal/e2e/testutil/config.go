@@ -171,6 +171,18 @@ func WithProxyBuffering(mode string, bufferSize int) ProxyOption {
 	}
 }
 
+// WithProxyRequestBuffering 设置请求体缓冲模式。
+//
+// mode 为 "off" 时启用请求体流式转发（等价 nginx proxy_request_buffering off）。
+func WithProxyRequestBuffering(mode string) ProxyOption {
+	return func(p *config.ProxyConfig) {
+		if p.Buffering == nil {
+			p.Buffering = &config.ProxyBufferingConfig{}
+		}
+		p.Buffering.RequestMode = mode
+	}
+}
+
 // WithProxyNextUpstream 设置故障转移。
 func WithProxyNextUpstream(tries int, httpCodes []int) ProxyOption {
 	return func(p *config.ProxyConfig) {

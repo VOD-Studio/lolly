@@ -607,8 +607,8 @@ func TestAnyProxyRequestStreaming(t *testing.T) {
 	withStreaming := func() *config.ServerConfig {
 		return &config.ServerConfig{
 			Proxy: []config.ProxyConfig{{
-				Path: "/",
-				Targets: []config.ProxyTarget{{URL: "http://127.0.0.1:8080"}},
+				Path:      "/",
+				Targets:   []config.ProxyTarget{{URL: "http://127.0.0.1:8080"}},
 				Buffering: &config.ProxyBufferingConfig{RequestMode: "off"},
 			}},
 		}
@@ -616,8 +616,8 @@ func TestAnyProxyRequestStreaming(t *testing.T) {
 	withoutStreaming := func() *config.ServerConfig {
 		return &config.ServerConfig{
 			Proxy: []config.ProxyConfig{{
-				Path: "/",
-				Targets: []config.ProxyTarget{{URL: "http://127.0.0.1:8080"}},
+				Path:      "/",
+				Targets:   []config.ProxyTarget{{URL: "http://127.0.0.1:8080"}},
 				Buffering: &config.ProxyBufferingConfig{Mode: "off"},
 			}},
 		}
