@@ -121,6 +121,7 @@ type Proxy struct {
 	targets          []*loadbalance.Target           // 后端目标列表
 	mu               sync.RWMutex                    // 保护并发访问的读写锁
 	started          atomic.Bool                     // 代理启动标志
+	requestStreaming bool                            // 请求体流式转发（buffering.request_mode: off）
 	cacheIgnoreSet   map[string]bool                 // 缓存时忽略的响应头集合
 	refreshGroup     singleflight.Group              // 合并并发后台缓存刷新
 }
@@ -218,8 +219,20 @@ func NewProxy(cfg *config.ProxyConfig, targets []*loadbalance.Target, transportC
 	}
 	p.cacheIgnoreSet = cacheIgnoreSet
 
+	// 请求体流式转发：buffering.request_mode == "off"
+	p.requestStreaming = cfg.Buffering.RequestStreamingEnabled()
+
 	return p, nil
 }
+
+// RequestStreamingEnabled 报告是否启用了请求体流式转发。
+//
+// 启用时，带 body stream 的请求将直接把流交给上游 HostClient，
+// 不在 lolly 侧物化；同时禁用 next_upstream 重试与代理缓存。
+//
+// 返回值：
+//   - bool: true 表示已启用
+func (p *Proxy) RequestStreamingEnabled() bool { return p.requestStreaming }
 
 // cacheVaryHeaders 返回用于构建缓存键的 Vary 请求头列表。
 //
@@ -626,10 +639,24 @@ func (p *Proxy) ServeHTTP(ctx *fasthttp.RequestCtx) {
 		upstreamTimingPool.Put(timing)
 	}()
 
+	// 请求体流式：启用且存在 body stream 时，禁用重试与缓存（流不可回放）。
+	// 仅对真正带 body 的请求才进入流式路径；GET/HEAD 无 body stream 仍走原逻辑。
+	streamRequestBody := p.requestStreaming && ctx.Request.BodyStream() != nil
+
 	// 故障转移配置
 	maxTries := p.config.NextUpstream.Tries
 	if maxTries <= 0 {
 		maxTries = 1 // 默认不重试
+	}
+	// 流式请求体不可重试：一旦向上游写入部分 body，流无法回放给另一个目标。
+	if streamRequestBody && maxTries > 1 {
+		if logging.Debug().Enabled() {
+			proxyDebugLog("[PROXY] 流式请求体禁用 next_upstream 重试",
+				"method", b2s(ctx.Method()),
+				"originalTries", maxTries,
+			)
+		}
+		maxTries = 1
 	}
 	httpCodes := p.config.NextUpstream.HTTPCodes
 	if len(httpCodes) == 0 {
@@ -763,8 +790,8 @@ func (p *Proxy) ServeHTTP(ctx *fasthttp.RequestCtx) {
 			)
 		}
 
-		// 尝试从缓存获取（如果启用）
-		if p.cache != nil && attempt == 0 {
+		// 尝试从缓存获取（如果启用且非流式请求体）
+		if p.cache != nil && attempt == 0 && !streamRequestBody {
 			// 检查请求方法是否允许缓存
 			method := string(ctx.Request.Header.Method())
 			path := string(ctx.Request.URI().Path())
@@ -867,7 +894,7 @@ func (p *Proxy) ServeHTTP(ctx *fasthttp.RequestCtx) {
 			}
 
 			// 尝试使用 stale 缓存
-			if p.cache != nil {
+			if p.cache != nil && !streamRequestBody {
 				hashKey, origKey := computeCacheKey(p.cacheVaryHeaders(nil))
 				isTimeout := errors.Is(err, fasthttp.ErrTimeout)
 				if staleEntry, ok := p.cache.GetStale(hashKey, origKey, isTimeout); ok {
@@ -880,7 +907,7 @@ func (p *Proxy) ServeHTTP(ctx *fasthttp.RequestCtx) {
 			}
 
 			// 释放缓存锁
-			if p.cache != nil && attempt == 0 {
+			if p.cache != nil && attempt == 0 && !streamRequestBody {
 				hashKey, _ := computeCacheKey(p.cacheVaryHeaders(nil))
 				p.cache.ReleaseLock(hashKey, err)
 			}
@@ -930,7 +957,7 @@ func (p *Proxy) ServeHTTP(ctx *fasthttp.RequestCtx) {
 
 		if shouldRetry {
 			// 释放缓存锁
-			if p.cache != nil && attempt == 0 {
+			if p.cache != nil && attempt == 0 && !streamRequestBody {
 				hashKey, _ := computeCacheKey(p.cacheVaryHeaders(nil))
 				p.cache.ReleaseLock(hashKey, fmt.Errorf("HTTP %d", statusCode))
 			}
@@ -950,8 +977,8 @@ func (p *Proxy) ServeHTTP(ctx *fasthttp.RequestCtx) {
 			p.healthChecker.MarkHealthy(target)
 		}
 
-		// 存入缓存（如果启用且响应可缓存）
-		if p.cache != nil {
+		// 存入缓存（如果启用且响应可缓存且非流式请求体）
+		if p.cache != nil && !streamRequestBody {
 			// 再次检查方法是否允许缓存
 			method := string(ctx.Request.Header.Method())
 			path := string(ctx.Request.URI().Path())

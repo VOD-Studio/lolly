@@ -19,6 +19,7 @@
 package proxy
 
 import (
+	"bytes"
 	"net"
 	"sync/atomic"
 	"testing"
@@ -1233,5 +1234,134 @@ func TestProxyConnectionCount_Retry(t *testing.T) {
 
 	if atomic.LoadInt64(&targets[0].Connections) != 0 {
 		t.Errorf("expected connections to return to 0 after retry, got %d", targets[0].Connections)
+	}
+}
+
+// TestProxy_RequestStreamingEnabled 测试 NewProxy 正确解析请求体流式配置。
+func TestProxy_RequestStreamingEnabled(t *testing.T) {
+	cfg := testutil.NewTestProxyConfig("/", "http://127.0.0.1:1")
+	cfg.Buffering = &config.ProxyBufferingConfig{RequestMode: "off"}
+	p, err := NewProxy(cfg, testutil.NewTestTargets("http://127.0.0.1:1"), nil, nil)
+	if err != nil {
+		t.Fatalf("NewProxy() error: %v", err)
+	}
+	if !p.RequestStreamingEnabled() {
+		t.Error("RequestStreamingEnabled() = false, want true")
+	}
+
+	// 默认配置应为 false
+	cfg2 := testutil.NewTestProxyConfig("/", "http://127.0.0.1:1")
+	p2, _ := NewProxy(cfg2, testutil.NewTestTargets("http://127.0.0.1:1"), nil, nil)
+	if p2.RequestStreamingEnabled() {
+		t.Error("default RequestStreamingEnabled() = true, want false")
+	}
+}
+
+// TestServeHTTP_StreamRequestBody 测试请求体流式端到端转发。
+//
+// 构造带 BodyStream 的请求上下文，启用 request_mode: off，
+// 验证后端收到的请求体与发送一致，且 lolly 侧未提前物化整个 body。
+func TestServeHTTP_StreamRequestBody(t *testing.T) {
+	body := bytes.Repeat([]byte("lolly-stream-"), 8*1024) // ~104KB，超过默认 inline 阈值
+
+	var gotBody []byte
+	var gotLen int
+	backend := &fasthttp.Server{
+		Handler: func(ctx *fasthttp.RequestCtx) {
+			gotLen = ctx.Request.Header.ContentLength()
+			gotBody = append(gotBody, ctx.Request.Body()...)
+			ctx.SetStatusCode(fasthttp.StatusOK)
+			ctx.SetBodyString("ok")
+		},
+	}
+
+	backendLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = backendLn.Close() }()
+	go func() { _ = backend.Serve(backendLn) }()
+	time.Sleep(50 * time.Millisecond)
+
+	cfg := testutil.NewTestProxyConfig("/", "http://"+backendLn.Addr().String())
+	cfg.Buffering = &config.ProxyBufferingConfig{RequestMode: "off"}
+
+	targets := testutil.NewTestTargets("http://" + backendLn.Addr().String())
+	targets[0].Healthy.Store(true)
+
+	p, err := NewProxy(cfg, targets, nil, nil)
+	if err != nil {
+		t.Fatalf("NewProxy() error: %v", err)
+	}
+	if !p.RequestStreamingEnabled() {
+		t.Fatal("proxy should enable request streaming")
+	}
+
+	// 构造带 BodyStream 的请求（模拟 fasthttp server StreamRequestBody=true 的入站形态）
+	ctx := testutil.NewRequestCtx("POST", "/upload")
+	ctx.Request.Header.SetContentLength(len(body))
+	ctx.Request.SetBodyStream(bytes.NewReader(body), len(body))
+
+	p.ServeHTTP(ctx)
+
+	if ctx.Response.StatusCode() != fasthttp.StatusOK {
+		t.Fatalf("status = %d, want 200", ctx.Response.StatusCode())
+	}
+	if gotLen != len(body) {
+		t.Errorf("backend Content-Length = %d, want %d", gotLen, len(body))
+	}
+	if !bytes.Equal(gotBody, body) {
+		t.Errorf("backend body mismatch: got %d bytes, want %d bytes", len(gotBody), len(body))
+	}
+}
+
+// TestServeHTTP_StreamRequestBody_NoRetry 验证流式请求体禁用 next_upstream 重试。
+//
+// 后端返回 503（默认重试码），配置 tries=3，但因流式请求体不可回放，
+// 应只命中后端一次并最终返回 503。
+func TestServeHTTP_StreamRequestBody_NoRetry(t *testing.T) {
+	var hits int32
+	backend := &fasthttp.Server{
+		Handler: func(ctx *fasthttp.RequestCtx) {
+			atomic.AddInt32(&hits, 1)
+			// 排空请求体以避免连接复用问题
+			_ = ctx.Request.Body()
+			ctx.SetStatusCode(fasthttp.StatusServiceUnavailable)
+		},
+	}
+
+	backendLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = backendLn.Close() }()
+	go func() { _ = backend.Serve(backendLn) }()
+	time.Sleep(50 * time.Millisecond)
+
+	cfg := testutil.NewTestProxyConfig("/", "http://"+backendLn.Addr().String())
+	cfg.Buffering = &config.ProxyBufferingConfig{RequestMode: "off"}
+	cfg.NextUpstream.Tries = 3
+	cfg.NextUpstream.HTTPCodes = []int{502, 503, 504}
+
+	targets := testutil.NewTestTargets("http://" + backendLn.Addr().String())
+	targets[0].Healthy.Store(true)
+
+	p, err := NewProxy(cfg, targets, nil, nil)
+	if err != nil {
+		t.Fatalf("NewProxy() error: %v", err)
+	}
+
+	body := []byte("stream-body-content")
+	ctx := testutil.NewRequestCtx("POST", "/upload")
+	ctx.Request.Header.SetContentLength(len(body))
+	ctx.Request.SetBodyStream(bytes.NewReader(body), len(body))
+
+	p.ServeHTTP(ctx)
+
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Errorf("backend hits = %d, want 1 (streaming disables retry)", got)
+	}
+	if ctx.Response.StatusCode() != fasthttp.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", ctx.Response.StatusCode())
 	}
 }
