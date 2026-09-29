@@ -6,6 +6,7 @@
 //   - PUT 路由注册
 //   - DELETE 路由注册
 //   - HEAD 路由注册
+//   - 任意 HTTP 方法路由注册
 //   - 多方法路由区分
 //   - 多路由注册
 //   - 未匹配路由处理
@@ -220,6 +221,28 @@ func TestRouterHEAD(t *testing.T) {
 
 	if !called {
 		t.Error("HEAD handler 未被调用")
+	}
+}
+
+// TestRouterANY 测试任意 HTTP 方法路由注册。
+func TestRouterANY(t *testing.T) {
+	r := NewRouter()
+	r.ANY("/proxy", func(ctx *fasthttp.RequestCtx) {
+		_, _ = ctx.Write(ctx.Method())
+	})
+
+	for _, method := range []string{"GET", "PATCH", "OPTIONS", "PROPFIND"} {
+		t.Run(method, func(t *testing.T) {
+			var ctx fasthttp.RequestCtx
+			ctx.Request.Header.SetMethod(method)
+			ctx.Request.SetRequestURI("/proxy")
+
+			r.Handler()(&ctx)
+
+			if got := string(ctx.Response.Body()); got != method {
+				t.Errorf("响应体 = %q, want %q", got, method)
+			}
+		})
 	}
 }
 

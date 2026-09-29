@@ -1,7 +1,7 @@
 // Package handler 提供 HTTP 请求处理器，包括路由、静态文件服务和零拷贝传输。
 //
 // 该文件包含路由器相关的核心逻辑，包括：
-//   - HTTP 方法路由注册（GET、POST、PUT、DELETE、HEAD）
+//   - HTTP 方法路由注册（包括任意方法）
 //   - 路由器创建和处理器获取
 //
 // 主要用途：
@@ -23,7 +23,7 @@ import (
 // Router HTTP 请求路由器。
 //
 // 封装 fasthttp/router，提供简洁的路由注册接口。
-// 支持 GET、POST、PUT、DELETE、HEAD 等 HTTP 方法。
+// 支持按具体方法或任意 HTTP 方法注册路由。
 type Router struct {
 	// router 底层 fasthttp 路由器实例
 	router *router.Router
@@ -99,6 +99,17 @@ func (r *Router) DELETE(path string, handler fasthttp.RequestHandler) {
 //   - handler: 请求处理函数
 func (r *Router) HEAD(path string, handler fasthttp.RequestHandler) {
 	r.router.HEAD(path, handler)
+}
+
+// ANY 注册匹配任意 HTTP 方法的路由。
+//
+// 用于反向代理等需要保留并转发客户端原始方法的处理器。
+//
+// 参数：
+//   - path: 路由路径
+//   - handler: 请求处理函数
+func (r *Router) ANY(path string, handler fasthttp.RequestHandler) {
+	r.router.ANY(path, handler)
 }
 
 // Handler 返回路由处理器。

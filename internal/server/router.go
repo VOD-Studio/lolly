@@ -207,7 +207,7 @@ func (s *Server) registerStaticHandlersWithLocationEngine(cfg *config.ServerConf
 // registerProxyRoutes 注册代理路由。
 //
 // 根据配置为路由器注册代理路径，创建代理处理器和健康检查器。
-// 支持 GET、POST、PUT、DELETE、HEAD 等 HTTP 方法。
+// 支持任意 HTTP 方法，并将客户端方法原样交给代理处理器。
 //
 // 参数：
 //   - router: 路由器实例，用于注册路由规则
@@ -234,11 +234,7 @@ func (s *Server) registerProxyRoutes(router *handler.Router, serverCfg *config.S
 			routePath += "/"
 		}
 		wildcardPath := routePath + "{path:*}"
-		router.GET(wildcardPath, p.ServeHTTP)
-		router.POST(wildcardPath, p.ServeHTTP)
-		router.PUT(wildcardPath, p.ServeHTTP)
-		router.DELETE(wildcardPath, p.ServeHTTP)
-		router.HEAD(wildcardPath, p.ServeHTTP)
+		router.ANY(wildcardPath, p.ServeHTTP)
 	}
 }
 

@@ -662,6 +662,33 @@ func TestRegisterRoute_各种类型(t *testing.T) {
 	}
 }
 
+// TestRegisterProxyRoutes_AllMethods 测试代理路由接受任意 HTTP 方法。
+func TestRegisterProxyRoutes_AllMethods(t *testing.T) {
+	cfg := &config.Config{
+		Servers: []config.ServerConfig{{
+			Proxy: []config.ProxyConfig{{
+				Path:    "/api",
+				Targets: []config.ProxyTarget{{URL: "http://127.0.0.1:1", Down: true}},
+			}},
+		}},
+	}
+	s := New(cfg)
+	router := handler.NewRouter()
+	s.registerProxyRoutes(router, &cfg.Servers[0])
+
+	for _, method := range []string{"PATCH", "OPTIONS", "PROPFIND"} {
+		t.Run(method, func(t *testing.T) {
+			var ctx fasthttp.RequestCtx
+			ctx.Request.Header.SetMethod(method)
+			ctx.Request.SetRequestURI("/api/resource")
+
+			router.Handler()(&ctx)
+
+			assert.Equal(t, fasthttp.StatusBadGateway, ctx.Response.StatusCode())
+		})
+	}
+}
+
 // TestRegisterProxyRoutesWithLocationEngine 测试代理路由注册到 LocationEngine。
 func TestRegisterProxyRoutesWithLocationEngine(t *testing.T) {
 	cfg := &config.Config{
