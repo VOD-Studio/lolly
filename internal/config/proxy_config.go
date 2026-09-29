@@ -76,18 +76,30 @@ type ProxyConfig struct {
 
 // ProxyBufferingConfig 代理缓冲配置。
 //
-// 控制代理响应的缓冲行为：
-//   - "default" 或 "on": 缓冲响应到内存/临时文件
-//   - "off": 流式转发响应，不缓冲
+// 控制代理的缓冲行为，分别独立控制请求体和响应体：
+//   - 响应（Mode）："default"/"on" 缓冲到内存/临时文件，"off" 流式转发响应
+//   - 请求（RequestMode）："default"/"on" 完整缓冲请求体后再转发，
+//     "off" 流式转发请求体（等价 nginx proxy_request_buffering off）
+//
+// RequestMode=off 时：
+//   - 请求体在 客户端→lolly→上游 全程不落全量内存，支持大上传低内存
+//   - 带请求体的请求禁用 next_upstream 重试（流不可回放）
+//   - $request_body 类变量为空（与 nginx 行为一致）
 //
 // 使用示例：
 //
 //	buffering:
-//	  mode: "off"
+//	  mode: "off"             # 响应流式
+//	  request_mode: "off"     # 请求体流式
 type ProxyBufferingConfig struct {
-	// Mode 缓冲模式
+	// Mode 响应缓冲模式
 	// 可选值："default"（默认缓冲）, "on"（强制缓冲）, "off"（关闭缓冲）
 	Mode string `yaml:"mode"`
+
+	// RequestMode 请求体缓冲模式
+	// 可选值："default"（默认，完整缓冲）, "on"（强制完整缓冲）, "off"（流式转发）
+	// 为空时按 "default" 处理，向后兼容
+	RequestMode string `yaml:"request_mode"`
 
 	// BufferSize 响应缓冲区大小（字节）
 	// 0 表示使用默认值
@@ -104,6 +116,17 @@ type ProxyBufferingConfig struct {
 
 	// BufferSizeEach 每个缓冲区大小（字节，解析后）
 	BufferSizeEach int `yaml:"-"`
+}
+
+// RequestStreamingEnabled 报告是否启用了请求体流式转发。
+//
+// 仅当 RequestMode == "off" 时返回 true。
+// Mode/on/空 都按完整缓冲处理。
+//
+// 返回值：
+//   - bool: true 表示请求体应流式转发到上游
+func (c *ProxyBufferingConfig) RequestStreamingEnabled() bool {
+	return c != nil && c.RequestMode == "off"
 }
 
 // ParseBuffers 解析 Buffers 配置字符串。

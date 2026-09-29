@@ -1,7 +1,7 @@
 - [x] 按 listen 分组，同端口内部做 Host/SNI 分流。
 - [x] 代理路由接受全部 HTTP 方法，尤其 PATCH、OPTIONS。
 - [x] 让 body limit 的 0 表示 unlimited。
-- [ ] 实现请求体流式反代。
+- [x] 实现请求体流式反代。
 - [ ] 修复 HTTP/2 集成。
 - [ ] 修复 WebSocket deadline 和 X-Forwarded-Host。
 - [ ] 确定 ACME 迁移方案。

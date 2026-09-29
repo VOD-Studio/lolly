@@ -213,6 +213,52 @@ func TestProxyBufferingConfig_ParseBuffers(t *testing.T) {
 	}
 }
 
+// TestProxyBufferingConfig_RequestStreamingEnabled 测试请求体流式判定。
+func TestProxyBufferingConfig_RequestStreamingEnabled(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  *ProxyBufferingConfig
+		want bool
+	}{
+		{name: "nil", cfg: nil, want: false},
+		{name: "empty request_mode", cfg: &ProxyBufferingConfig{}, want: false},
+		{name: "default", cfg: &ProxyBufferingConfig{RequestMode: "default"}, want: false},
+		{name: "on", cfg: &ProxyBufferingConfig{RequestMode: "on"}, want: false},
+		{name: "off", cfg: &ProxyBufferingConfig{RequestMode: "off"}, want: true},
+		{name: "response off only", cfg: &ProxyBufferingConfig{Mode: "off"}, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.cfg.RequestStreamingEnabled(); got != tt.want {
+				t.Errorf("RequestStreamingEnabled() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestValidateProxyBuffering 测试代理缓冲配置校验。
+func TestValidateProxyBuffering(t *testing.T) {
+	tests := []struct {
+		name    string
+		cfg     *ProxyBufferingConfig
+		wantErr bool
+	}{
+		{name: "nil", cfg: nil, wantErr: false},
+		{name: "empty", cfg: &ProxyBufferingConfig{}, wantErr: false},
+		{name: "valid off", cfg: &ProxyBufferingConfig{Mode: "off", RequestMode: "off"}, wantErr: false},
+		{name: "invalid mode", cfg: &ProxyBufferingConfig{Mode: "yes"}, wantErr: true},
+		{name: "invalid request_mode", cfg: &ProxyBufferingConfig{RequestMode: "yes"}, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateProxyBuffering(tt.cfg)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("validateProxyBuffering() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestLoad_Include(t *testing.T) {
 	t.Run("append servers from include", func(t *testing.T) {
 		tmpDir := t.TempDir()

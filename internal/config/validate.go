@@ -641,6 +641,40 @@ func validateProxy(p *ProxyConfig) error {
 		}
 	}
 
+	// 验证 buffering 配置
+	if err := validateProxyBuffering(p.Buffering); err != nil {
+		return fmt.Errorf("buffering: %w", err)
+	}
+
+	return nil
+}
+
+// validateProxyBuffering 验证代理缓冲配置。
+//
+// 校验响应缓冲模式（Mode）和请求体缓冲模式（RequestMode）取值合法。
+// 空字符串视为 "default"，向后兼容旧配置。
+//
+// 参数：
+//   - b: 代理缓冲配置，nil 时跳过
+//
+// 返回值：
+//   - error: 取值非法时返回错误
+func validateProxyBuffering(b *ProxyBufferingConfig) error {
+	if b == nil {
+		return nil
+	}
+	validModes := map[string]struct{}{
+		"":        {},
+		"default": {},
+		"on":      {},
+		"off":     {},
+	}
+	if _, ok := validModes[b.Mode]; !ok {
+		return fmt.Errorf("无效的 mode: %s（有效值: default, on, off）", b.Mode)
+	}
+	if _, ok := validModes[b.RequestMode]; !ok {
+		return fmt.Errorf("无效的 request_mode: %s（有效值: default, on, off）", b.RequestMode)
+	}
 	return nil
 }
 
