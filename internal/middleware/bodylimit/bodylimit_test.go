@@ -22,6 +22,7 @@ func TestParseSize(t *testing.T) {
 	}{
 		{"empty string", "", 1 << 20, false},                  // 默认 1MB
 		{"plain bytes", "1024", 1024, false},                  // 纯数字
+		{"zero means unlimited", "0", 0, false},               // 0 解析为 0（unlimited）
 		{"with b", "2048b", 2048, false},                      // 带 b 单位
 		{"kilobytes", "10kb", 10 * 1024, false},               // KB
 		{"megabytes", "1mb", 1024 * 1024, false},              // MB
@@ -125,6 +126,87 @@ func TestBodyLimit_Process(t *testing.T) {
 
 			if ctx.Response.StatusCode() != tt.expectedStatus {
 				t.Errorf("status code = %d, want %d", ctx.Response.StatusCode(), tt.expectedStatus)
+			}
+		})
+	}
+}
+
+// TestBodyLimit_ProcessZeroIsUnlimited 测试 "0" 表示不限制请求体大小。
+//
+// 配置为 "0" 时，超过任何隐含上限的请求体都应被放行，不返回 413。
+func TestBodyLimit_ProcessZeroIsUnlimited(t *testing.T) {
+	bl, err := New("0")
+	if err != nil {
+		t.Fatalf("创建中间件失败: %v", err)
+	}
+	if bl.maxBodySize != UnlimitedSize {
+		t.Fatalf("New(\"0\").maxBodySize = %d, want %d (UnlimitedSize)", bl.maxBodySize, UnlimitedSize)
+	}
+
+	// 200 字节，远超若误把 0 当成"禁止"或兜底默认值时会触发的限制
+	body := strings.Repeat("a", 200)
+
+	nextHandler := func(ctx *fasthttp.RequestCtx) {
+		ctx.SetStatusCode(fasthttp.StatusOK)
+	}
+
+	handler := bl.Process(nextHandler)
+
+	ctx := &fasthttp.RequestCtx{}
+	ctx.Request.Header.SetMethod("POST")
+	ctx.Request.Header.SetContentLength(len(body))
+	ctx.Request.SetBodyStream(bytes.NewReader([]byte(body)), len(body))
+
+	handler(ctx)
+
+	if ctx.Response.StatusCode() != fasthttp.StatusOK {
+		t.Errorf("unlimited 模式下应放行: status code = %d, want %d", ctx.Response.StatusCode(), fasthttp.StatusOK)
+	}
+}
+
+// TestBodyLimit_PathZeroOverridesGlobal 测试路径级 "0" 覆盖全局限制为不限制。
+//
+// 全局配 1mb，/upload 路径配 "0"：/upload 上的大 body 应放行，
+// 其他路径上的大 body 仍应被全局限制拒绝。
+func TestBodyLimit_PathZeroOverridesGlobal(t *testing.T) {
+	bl, err := New("1mb")
+	if err != nil {
+		t.Fatalf("创建中间件失败: %v", err)
+	}
+	if err := bl.AddPathLimit("/upload", "0"); err != nil {
+		t.Fatalf("添加路径限制失败: %v", err)
+	}
+
+	// 2MB，超过全局 1mb 限制
+	largeBody := strings.Repeat("a", 2*1024*1024)
+
+	tests := []struct {
+		name           string
+		path           string
+		expectedStatus int
+	}{
+		{"path with zero override passes", "/upload/file", fasthttp.StatusOK},
+		{"other path still limited", "/other/path", fasthttp.StatusRequestEntityTooLarge},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			nextHandler := func(ctx *fasthttp.RequestCtx) {
+				ctx.SetStatusCode(fasthttp.StatusOK)
+			}
+
+			handler := bl.Process(nextHandler)
+
+			ctx := &fasthttp.RequestCtx{}
+			ctx.Request.Header.SetMethod("POST")
+			ctx.Request.SetRequestURI(tt.path)
+			ctx.Request.Header.SetContentLength(len(largeBody))
+			ctx.Request.SetBodyStream(bytes.NewReader([]byte(largeBody)), len(largeBody))
+
+			handler(ctx)
+
+			if ctx.Response.StatusCode() != tt.expectedStatus {
+				t.Errorf("path %q: status code = %d, want %d", tt.path, ctx.Response.StatusCode(), tt.expectedStatus)
 			}
 		})
 	}

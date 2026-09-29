@@ -29,6 +29,12 @@ import (
 // DefaultMaxBodySize 默认请求体大小限制为 1MB。
 const DefaultMaxBodySize = 1 << 20 // 1MB
 
+// UnlimitedSize 表示不限制请求体大小。
+//
+// 取值 0，与 nginx 的 client_max_body_size 0 语义一致：禁用请求体大小检查。
+// ParseSize("0") 返回 0，执行层（Process / adapter）据此跳过限制逻辑。
+const UnlimitedSize int64 = 0
+
 // BodyLimit 请求体大小限制中间件。
 //
 // 限制请求体的最大字节数，超过限制的请求将被拒绝并返回 413 错误。
@@ -42,7 +48,7 @@ type BodyLimit struct {
 // New 创建请求体大小限制中间件。
 //
 // 参数：
-//   - maxBodySize: 最大请求体大小字符串，如 "1mb", "10kb" 等
+//   - maxBodySize: 最大请求体大小字符串，如 "1mb", "10kb" 等；"0" 表示不限制
 //
 // 返回值：
 //   - *BodyLimit: 创建的中间件实例
@@ -82,7 +88,7 @@ func (bl *BodyLimit) Name() string {
 //
 // 参数：
 //   - path: 路径前缀
-//   - sizeStr: 大小字符串，如 "1mb", "10kb" 等
+//   - sizeStr: 大小字符串，如 "1mb", "10kb" 等；"0" 表示该路径不限制
 //
 // 返回值：
 //   - error: 解析大小字符串失败时的错误
@@ -148,6 +154,13 @@ func (bl *BodyLimit) Process(next fasthttp.RequestHandler) fasthttp.RequestHandl
 	return func(ctx *fasthttp.RequestCtx) {
 		path := string(ctx.Path())
 		limit := bl.GetLimit(path)
+
+		// 0 表示不限制请求体大小（与 nginx client_max_body_size 0 语义一致），
+		// 跳过 Content-Length 预检和流式包装，直接放行。
+		if limit == UnlimitedSize {
+			next(ctx)
+			return
+		}
 
 		// 检查 Content-Length 头
 		contentLength := ctx.Request.Header.ContentLength()
