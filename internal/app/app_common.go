@@ -189,6 +189,7 @@ func (a *App) initHTTP3() {
 	}
 
 	a.cfg.HTTP3.MaxBodySize = a.clientMaxBodySize()
+	a.cfg.HTTP3.StreamRequestBody = config.AnyProxyRequestStreaming(a.cfg.Servers)
 
 	a.http3Srv, err = http3.NewServer(&a.cfg.HTTP3, a.srv.GetHandler(), tlsConfig)
 	if err != nil {
@@ -217,6 +218,7 @@ func (a *App) initHTTP2() {
 	}
 
 	a.cfg.Servers[0].SSL.HTTP2.MaxBodySize = a.clientMaxBodySize()
+	a.cfg.Servers[0].SSL.HTTP2.StreamRequestBody = config.AnyProxyRequestStreaming(a.cfg.Servers)
 
 	a.http2Srv, err = http2.NewServer(&a.cfg.Servers[0].SSL.HTTP2, a.srv.GetHandler(), tlsConfig)
 	if err != nil {

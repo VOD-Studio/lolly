@@ -259,6 +259,34 @@ func TestValidateProxyBuffering(t *testing.T) {
 	}
 }
 
+// TestAnyProxyRequestStreaming 测试请求体流式检测的自由函数。
+func TestAnyProxyRequestStreaming(t *testing.T) {
+	servers := []ServerConfig{
+		{}, // 无代理
+		{
+			Proxy: []ProxyConfig{{
+				Path:      "/",
+				Targets:   []ProxyTarget{{URL: "http://127.0.0.1:1"}},
+				Buffering: &ProxyBufferingConfig{Mode: "off"},
+			}},
+		},
+	}
+	if AnyProxyRequestStreaming(servers) {
+		t.Error("无 request_mode: off 时应返回 false")
+	}
+
+	servers = append(servers, ServerConfig{
+		Proxy: []ProxyConfig{{
+			Path:      "/upload",
+			Targets:   []ProxyTarget{{URL: "http://127.0.0.1:1"}},
+			Buffering: &ProxyBufferingConfig{RequestMode: "off"},
+		}},
+	})
+	if !AnyProxyRequestStreaming(servers) {
+		t.Error("存在 request_mode: off 时应返回 true")
+	}
+}
+
 func TestLoad_Include(t *testing.T) {
 	t.Run("append servers from include", func(t *testing.T) {
 		tmpDir := t.TempDir()

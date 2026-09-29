@@ -43,6 +43,7 @@ type Server struct {
 	connWg                  sync.WaitGroup
 	GracefulShutdownTimeout time.Duration
 	maxBodySize             int64
+	streamRequestBody       bool
 	mu                      sync.RWMutex
 	running                 bool
 }
@@ -106,6 +107,7 @@ func NewServer(cfg *config.HTTP2Config, handler fasthttp.RequestHandler, tlsConf
 		pool:                    newConnectionPool(),
 		GracefulShutdownTimeout: gracefulTimeout,
 		maxBodySize:             cfg.MaxBodySize,
+		streamRequestBody:       cfg.StreamRequestBody,
 	}, nil
 }
 
@@ -214,6 +216,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 func (s *Server) serveHTTP2(conn net.Conn) {
 	adapter := NewFastHTTPHandlerAdapter(s.handler)
 	adapter.MaxBodySize = s.maxBodySize
+	adapter.StreamEnabled = s.streamRequestBody
 
 	opts := &http2.ServeConnOpts{
 		Context:    context.Background(),

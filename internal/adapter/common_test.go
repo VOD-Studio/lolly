@@ -427,3 +427,64 @@ func TestStreamRequestBodyZeroIsUnlimited(t *testing.T) {
 		t.Fatalf("请求体未被完整读入: got %d bytes, want %d", len(ctx.Request.Body()), len(bodyBytes))
 	}
 }
+
+// TestStreamRequestBody_StreamEnabled 测试流式注入路径。
+//
+// 当 StreamEnabled=true 时，请求体不应被物化到 ctx.Request.body，
+// 而应通过 SetBodyStream 暴露为 reader，供下游代理流式转发。
+func TestStreamRequestBody_StreamEnabled(t *testing.T) {
+	t.Run("known content length", func(t *testing.T) {
+		body := "stream-body-content"
+		a := NewCommonAdapter()
+		a.StreamEnabled = true
+
+		r := &http.Request{
+			Body:          io.NopCloser(strings.NewReader(body)),
+			ContentLength: int64(len(body)),
+		}
+		ctx := &fasthttp.RequestCtx{}
+		require.NoError(t, a.StreamRequestBody(r, ctx))
+
+		// StreamEnabled 下应通过 BodyStream 暴露 reader，而非物化到 body buffer。
+		// 注意：不能先调用 Body()，那会把 stream 物化并清空 bodyStream。
+		bs := ctx.Request.BodyStream()
+		require.NotNil(t, bs, "BodyStream 应非空")
+		got, err := io.ReadAll(bs)
+		require.NoError(t, err)
+		assert.Equal(t, body, string(got))
+	})
+
+	t.Run("chunked unknown length", func(t *testing.T) {
+		body := "chunked-stream"
+		a := NewCommonAdapter()
+		a.StreamEnabled = true
+
+		r := &http.Request{
+			Body:          io.NopCloser(strings.NewReader(body)),
+			ContentLength: -1,
+		}
+		ctx := &fasthttp.RequestCtx{}
+		require.NoError(t, a.StreamRequestBody(r, ctx))
+
+		bs := ctx.Request.BodyStream()
+		require.NotNil(t, bs)
+		got, err := io.ReadAll(bs)
+		require.NoError(t, err)
+		assert.Equal(t, body, string(got))
+	})
+
+	t.Run("exceeds MaxBodySize via Content-Length", func(t *testing.T) {
+		a := NewCommonAdapter()
+		a.StreamEnabled = true
+		a.MaxBodySize = 8
+
+		r := &http.Request{
+			Body:          io.NopCloser(strings.NewReader("0123456789")),
+			ContentLength: 10,
+		}
+		ctx := &fasthttp.RequestCtx{}
+		err := a.StreamRequestBody(r, ctx)
+		require.Error(t, err)
+		assert.Equal(t, fasthttp.StatusRequestEntityTooLarge, ctx.Response.StatusCode())
+	})
+}

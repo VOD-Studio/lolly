@@ -54,6 +54,12 @@ type CommonAdapter struct {
 
 	// MaxBodySize 限制允许读取的请求体最大字节数（0 表示不限制，与 nginx 语义一致）
 	MaxBodySize int64
+
+	// StreamEnabled 控制请求体是否以流式方式注入 fasthttp.Request。
+	// 为 true 时，请求体通过 SetBodyStream 交给 handler（及下游代理），
+	// 不在适配器层物化，支持请求体流式转发到上游。
+	// 为 false 时（默认），按既有阈值物化到 ctx.Request.body 缓冲区。
+	StreamEnabled bool
 }
 
 // NewCommonAdapter 创建新的共享适配器实例。
@@ -92,10 +98,13 @@ func (a *CommonAdapter) ResetContext(ctx *fasthttp.RequestCtx) {
 
 // StreamRequestBody 流式读取 HTTP 请求体到 fasthttp。
 //
-// 对于小于等于 DefaultBodyThreshold（64KB）的请求体，直接读取到内存；
-// 对于大于阈值的请求体，使用共享 bufferPool 进行流式处理，避免内存峰值。
-// 超过 MaxBodySize 的请求体会被拒绝并返回 413 错误；
-// MaxBodySize 为 0 时不限制请求体大小（与 nginx client_max_body_size 0 语义一致）。
+// 当 a.StreamRequestBody 为 true 时走流式路径（setRequestBodyStream）：
+// 请求体以 reader 形式注入 ctx.Request.BodyStream()，不在适配器层物化，
+// 支持下游代理直接把流转发到上游；r.Body 的关闭交由 net/http 框架负责。
+//
+// 为 false 时（默认）走物化路径：按阈值把请求体读入 ctx.Request.body，
+// 小于等于 DefaultBodyThreshold（64KB）直接读取，大于则用共享 buffer 流式拼装，
+// 超过 MaxBodySize 拒绝并返回 413；MaxBodySize 为 0 时不限制。
 //
 // 参数：
 //   - r: 标准库的 HTTP 请求
@@ -106,6 +115,10 @@ func (a *CommonAdapter) ResetContext(ctx *fasthttp.RequestCtx) {
 func (a *CommonAdapter) StreamRequestBody(r *http.Request, ctx *fasthttp.RequestCtx) error {
 	if r.Body == nil || r.Body == http.NoBody {
 		return nil
+	}
+
+	if a.StreamEnabled {
+		return a.setRequestBodyStream(r, ctx)
 	}
 
 	defer func() {
@@ -177,6 +190,45 @@ func (a *CommonAdapter) StreamRequestBody(r *http.Request, ctx *fasthttp.Request
 	if len(body) > 0 {
 		ctx.Request.SetBody(body)
 	}
+	return nil
+}
+
+// setRequestBodyStream 以流式方式把请求体注入 fasthttp.Request。
+//
+// 不在适配器层物化请求体：直接将 reader 经 SetBodyStream 交给 ctx.Request，
+// 供下游代理（buffering.request_mode: off）把流转发到上游。
+// r.Body 的关闭由 net/http 框架负责（server 端请求契约），此处不关闭。
+//
+// 超过 MaxBodySize 时拒绝并返回 413；MaxBodySize 为 0 时不限制。
+// chunked 请求（ContentLength <= 0）以 contentLength=-1 传入，fasthttp 将使用
+// Transfer-Encoding: chunked 发往上游。
+//
+// 参数：
+//   - r: 标准库的 HTTP 请求
+//   - ctx: fasthttp 请求上下文
+//
+// 返回值：
+//   - error: Content-Length 预检超限时返回错误
+func (a *CommonAdapter) setRequestBodyStream(r *http.Request, ctx *fasthttp.RequestCtx) error {
+	limit := a.MaxBodySize
+	unlimited := limit == 0
+
+	if !unlimited && r.ContentLength > 0 && r.ContentLength > limit {
+		ctx.Error("Request Entity Too Large", fasthttp.StatusRequestEntityTooLarge)
+		return fmt.Errorf("request body %d exceeds limit %d", r.ContentLength, limit)
+	}
+
+	bodyReader := io.Reader(r.Body)
+	if !unlimited {
+		// 限制模式下设硬上限，防止 chunked/未知长度请求体 OOM。
+		bodyReader = io.LimitReader(r.Body, limit+1)
+	}
+
+	contentLength := -1
+	if r.ContentLength > 0 {
+		contentLength = int(r.ContentLength)
+	}
+	ctx.Request.SetBodyStream(bodyReader, contentLength)
 	return nil
 }
 

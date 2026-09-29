@@ -41,6 +41,7 @@ type HTTP2Config struct {
 	H2CEnabled              bool          `yaml:"h2c_enabled"`
 	GracefulShutdownTimeout time.Duration `yaml:"graceful_shutdown_timeout"`
 	MaxBodySize             int64         `yaml:"max_body_size,omitempty"`
+	StreamRequestBody       bool          `yaml:"stream_request_body,omitempty"`
 }
 
 // HTTP3Config HTTP/3 (QUIC) 配置。
@@ -63,12 +64,13 @@ type HTTP2Config struct {
 //	  idle_timeout: 30s
 //	  enable_0rtt: true
 type HTTP3Config struct {
-	Listen      string        `yaml:"listen"`
-	MaxStreams  int           `yaml:"max_streams"`
-	IdleTimeout time.Duration `yaml:"idle_timeout"`
-	Enabled     bool          `yaml:"enabled"`
-	Enable0RTT  bool          `yaml:"enable_0rtt"`
-	MaxBodySize int64         `yaml:"max_body_size,omitempty"`
+	Listen            string        `yaml:"listen"`
+	MaxStreams        int           `yaml:"max_streams"`
+	IdleTimeout       time.Duration `yaml:"idle_timeout"`
+	Enabled           bool          `yaml:"enabled"`
+	Enable0RTT        bool          `yaml:"enable_0rtt"`
+	MaxBodySize       int64         `yaml:"max_body_size,omitempty"`
+	StreamRequestBody bool          `yaml:"stream_request_body,omitempty"`
 }
 
 // PerformanceConfig 性能配置。

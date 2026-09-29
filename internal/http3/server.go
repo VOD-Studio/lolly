@@ -62,6 +62,9 @@ type Server struct {
 
 	// maxBodySize 请求体大小限制
 	maxBodySize int64
+
+	// streamRequestBody 是否以流式方式把请求体注入 fasthttp.Request
+	streamRequestBody bool
 }
 
 // NewServer 创建 HTTP/3 服务器。
@@ -89,13 +92,15 @@ func NewServer(cfg *config.HTTP3Config, handler fasthttp.RequestHandler, tlsConf
 
 	adapter := NewAdapter()
 	adapter.MaxBodySize = cfg.MaxBodySize
+	adapter.StreamEnabled = cfg.StreamRequestBody
 
 	return &Server{
-		config:      cfg,
-		handler:     handler,
-		adapter:     adapter,
-		tlsConfig:   tlsConfig,
-		maxBodySize: cfg.MaxBodySize,
+		config:            cfg,
+		handler:           handler,
+		adapter:           adapter,
+		tlsConfig:         tlsConfig,
+		maxBodySize:       cfg.MaxBodySize,
+		streamRequestBody: cfg.StreamRequestBody,
 	}, nil
 }
 

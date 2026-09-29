@@ -129,6 +129,28 @@ func (c *ProxyBufferingConfig) RequestStreamingEnabled() bool {
 	return c != nil && c.RequestMode == "off"
 }
 
+// AnyProxyRequestStreaming 报告给定服务器配置中是否有任一代理启用了请求体流式。
+//
+// 用于 HTTP/2、HTTP/3 适配器与共享监听器的 fasthttp.Server 决定是否开启
+// 请求体流式读取。只要任一 server 的任一 proxy 配置了
+// buffering.request_mode: off 即返回 true。
+//
+// 参数：
+//   - servers: 待检查的服务器配置切片
+//
+// 返回值：
+//   - bool: true 表示至少有一个代理启用了请求体流式
+func AnyProxyRequestStreaming(servers []ServerConfig) bool {
+	for i := range servers {
+		for _, pc := range servers[i].Proxy {
+			if pc.Buffering.RequestStreamingEnabled() {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // ParseBuffers 解析 Buffers 配置字符串。
 //
 // 支持格式：
