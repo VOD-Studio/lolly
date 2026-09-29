@@ -564,6 +564,11 @@ proxy_request_buffering on;           # 默认，完整缓冲
 proxy_request_buffering off;          # 流式传输，支持上传进度
 ```
 
+lolly 对应配置为 `buffering.request_mode`（取值 `default`/`on`/`off`）。
+`off` 时请求体在 客户端→lolly→上游 全程不落全量内存，适合大文件上传。
+注意：带请求体的请求会禁用 `next_upstream` 重试（流不可回放），
+`$request_body` 变量为空（与 nginx 行为一致）。
+
 ### proxy_redirect
 
 修改后端返回的重定向头 Location 和 Refresh：

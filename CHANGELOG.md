@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+#### Proxy
+
+- **proxy**: 请求体流式反代（`buffering.request_mode: off`），对齐 nginx `proxy_request_buffering off`
+  - 请求体在 客户端→lolly→上游 全程不落全量内存，支持大文件上传低内存
+  - HTTP/1.1 经 `fasthttp.Server.StreamRequestBody`，HTTP/2/3 经适配器 `SetBodyStream`
+  - 带请求体的请求禁用 `next_upstream` 重试（流不可回放）；代理缓存对流式请求跳过
+  - 与 `client_max_body_size`/bodylimit 中间件联动，超限返回 413
+
 ## [0.5.0] - 2026-09-28
 
 ### Added

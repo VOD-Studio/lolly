@@ -298,7 +298,11 @@ timeout:
 
 ```yaml
 buffering:
-  mode: "default"             # default/on/off
+  mode: "default"             # 响应缓冲：default/on/off（off 为流式转发）
+  request_mode: "default"    # 请求体缓冲：default/on/off
+                             # off 为流式转发（等价 nginx proxy_request_buffering off），
+                             # 请求体在 客户端→lolly→上游 全程不落全量内存，
+                             # 适用于大文件上传；带 body 的请求将禁用 next_upstream 重试
   buffer_size: 16384          # 单缓冲区大小
   buffers: "8 16k"            # 8 个 16KB 缓冲区
 ```
