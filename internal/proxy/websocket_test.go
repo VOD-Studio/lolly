@@ -27,12 +27,14 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/valyala/fasthttp"
+	"rua.plus/lolly/internal/config"
 )
 
 // TestNewWebSocketBridge 测试桥接器创建
@@ -148,6 +150,26 @@ func TestDialTarget_HTTPS(t *testing.T) {
 	_, err := dialTarget("https://127.0.0.1:1", 100*time.Millisecond, nil)
 	if err == nil {
 		t.Error("Expected error for invalid HTTPS address")
+	}
+}
+
+// TestDialTarget_TLSClearsHandshakeDeadline 验证 TLS 握手超时不会限制后续 WebSocket 长连接。
+func TestDialTarget_TLSClearsHandshakeDeadline(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer server.Close()
+
+	conn, err := dialTarget(server.URL, 50*time.Millisecond, &config.ProxySSLConfig{
+		Enabled:            true,
+		InsecureSkipVerify: true,
+	})
+	if err != nil {
+		t.Fatalf("dialTarget() error: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	time.Sleep(100 * time.Millisecond)
+	if _, err = conn.Write([]byte("x")); err != nil {
+		t.Fatalf("TLS connection retained handshake deadline: %v", err)
 	}
 }
 
@@ -546,6 +568,7 @@ func TestReadWebSocketUpgradeResponse(t *testing.T) {
 	// 创建管道连接
 	conn1, conn2 := net.Pipe()
 	defer func() { _ = conn1.Close() }()
+	defer func() { _ = conn2.Close() }()
 
 	// 在另一个 goroutine 中写入响应
 	go func() {
@@ -554,7 +577,6 @@ func TestReadWebSocketUpgradeResponse(t *testing.T) {
 			"Connection: Upgrade\r\n" +
 			"\r\n"
 		_, _ = conn2.Write([]byte(response))
-		_ = conn2.Close()
 	}()
 
 	// 读取响应
@@ -583,6 +605,27 @@ func TestReadWebSocketUpgradeResponse_Timeout(t *testing.T) {
 	_, _, err := readWebSocketUpgradeResponse(conn1, 10*time.Millisecond)
 	if err == nil {
 		t.Error("Expected timeout error, got nil")
+	}
+}
+
+// TestReadWebSocketUpgradeResponse_ClearsDeadline 验证握手读取超时不会限制后续帧读取。
+func TestReadWebSocketUpgradeResponse_ClearsDeadline(t *testing.T) {
+	conn1, conn2 := net.Pipe()
+	defer func() { _ = conn1.Close() }()
+	defer func() { _ = conn2.Close() }()
+
+	go func() {
+		_, _ = conn2.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"))
+		time.Sleep(100 * time.Millisecond)
+		_, _ = conn2.Write([]byte("x"))
+	}()
+
+	_, reader, err := readWebSocketUpgradeResponse(conn1, 50*time.Millisecond)
+	if err != nil {
+		t.Fatalf("readWebSocketUpgradeResponse() error: %v", err)
+	}
+	if _, err = reader.ReadByte(); err != nil {
+		t.Fatalf("connection retained upgrade deadline: %v", err)
 	}
 }
 

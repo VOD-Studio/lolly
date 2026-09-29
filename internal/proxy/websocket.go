@@ -260,6 +260,10 @@ func dialTarget(targetURL string, timeout time.Duration, proxySSL *config.ProxyS
 		_ = conn.Close()
 		return nil, fmt.Errorf("TLS handshake failed: %w", err)
 	}
+	if err := tlsConn.SetDeadline(time.Time{}); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
 	return tlsConn, nil
 }
 
@@ -353,6 +357,10 @@ func readWebSocketUpgradeResponse(conn net.Conn, timeout time.Duration) (*http.R
 	resp, err := http.ReadResponse(reader, nil)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to read upgrade response: %w", err)
+	}
+	if err := conn.SetReadDeadline(time.Time{}); err != nil {
+		_ = resp.Body.Close()
+		return nil, nil, err
 	}
 
 	return resp, reader, nil
