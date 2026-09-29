@@ -3,12 +3,14 @@
 // 该文件包含 HTTP/2 服务器的核心实现，包括：
 //   - 基于 golang.org/x/net/http2 的 HTTP/2 服务器
 //   - ALPN 协议协商支持
+//   - 明文 h2c 连接的嗅探与回退（见 h2c.go）
 //   - 与现有 fasthttp handler 的集成
 //   - 优雅关闭支持
 //
 // 主要用途：
 //
-//	用于在现有 TCP 监听器上提供 HTTP/2 协议支持，通过 ALPN 协商自动选择协议。
+//	用于在现有 TCP 监听器上提供 HTTP/2 协议支持：TLS 监听器按 ALPN 协商，
+//	明文监听器按 HTTP/2 连接前导嗅探，未命中的连接回退到 HTTP/1.1。
 //
 // 作者：xfy
 package http2
@@ -21,6 +23,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/valyala/fasthttp"
@@ -32,6 +35,12 @@ import (
 // Server HTTP/2 服务器。
 //
 // 包装 golang.org/x/net/http2 服务器，提供与 fasthttp handler 的集成。
+//
+// 两种驱动方式互斥：
+//   - Serve(ln)：自带 Accept 循环，TLS 走 ALPN、明文走前导嗅探，HTTP/1.1
+//     回退逐连接调用 fasthttp.ServeConn；
+//   - Wrap(ln)：只嗅探 h2c 连接，HTTP/1.1 连接交回外层的 fasthttp.Serve，
+//     从而复用 fasthttp 的监听器与连接生命周期。
 type Server struct {
 	listener                net.Listener
 	http2Server             *http2.Server
@@ -44,8 +53,35 @@ type Server struct {
 	GracefulShutdownTimeout time.Duration
 	maxBodySize             int64
 	streamRequestBody       bool
+	sniffTimeout            time.Duration
+	maxConns                int
+	activeConns             atomic.Int64
+	ctx                     context.Context
+	cancel                  context.CancelFunc
 	mu                      sync.RWMutex
 	running                 bool
+}
+
+// Option Server 的可选配置。
+//
+// 与 ssl.NewTLSManager 一致采用函数式选项，避免为少量参数继续膨胀
+// NewServer 的位置参数列表。
+type Option func(*Server)
+
+// WithMaxConcurrentConns 限制 Wrap 模式（明文 h2c 嗅探）下的并发连接数。
+//
+// h2c 连接由嗅探器直接交给 ServeConn，不经过 fasthttp 的 Accept 循环，
+// 因此不受 fasthttp 的 Concurrency 约束；这里显式把同一上限套到 HTTP/2
+// 连接上，避免嗅探分派成为无界的 goroutine 来源。Serve 模式自带独立的
+// Accept 循环，连接数由调用方通过停止监听器控制，不受该选项影响。
+//
+// 参数：
+//   - n: 最大并发连接数，<=0 表示不限制
+//
+// 返回值：
+//   - Option: 应用该配置的选项
+func WithMaxConcurrentConns(n int) Option {
+	return func(s *Server) { s.maxConns = n }
 }
 
 // NewServer 创建 HTTP/2 服务器。
@@ -54,11 +90,12 @@ type Server struct {
 //   - cfg: HTTP/2 配置
 //   - handler: fasthttp 请求处理器
 //   - tlsConfig: TLS 配置（可选，但推荐用于 ALPN 协商）
+//   - opts: 可选配置
 //
 // 返回值：
 //   - *Server: HTTP/2 服务器实例
 //   - error: 配置无效时返回错误
-func NewServer(cfg *config.HTTP2Config, handler fasthttp.RequestHandler, tlsConfig *tls.Config) (*Server, error) {
+func NewServer(cfg *config.HTTP2Config, handler fasthttp.RequestHandler, tlsConfig *tls.Config, opts ...Option) (*Server, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("http2 config is nil")
 	}
@@ -75,7 +112,10 @@ func NewServer(cfg *config.HTTP2Config, handler fasthttp.RequestHandler, tlsConf
 		gracefulTimeout = 30 * time.Second
 	}
 
-	return &Server{
+	// ctx 被取消时 x/net/http2 会收尾对应连接，Stop 借此收敛在役 h2c 连接。
+	ctx, cancel := context.WithCancel(context.Background())
+
+	s := &Server{
 		stopChan:                make(chan struct{}),
 		http2Server:             h2s,
 		config:                  cfg,
@@ -85,7 +125,17 @@ func NewServer(cfg *config.HTTP2Config, handler fasthttp.RequestHandler, tlsConf
 		GracefulShutdownTimeout: gracefulTimeout,
 		maxBodySize:             cfg.MaxBodySize,
 		streamRequestBody:       cfg.StreamRequestBody,
-	}, nil
+		sniffTimeout:            defaultH2CSniffTimeout,
+		ctx:                     ctx,
+		cancel:                  cancel,
+	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(s)
+		}
+	}
+
+	return s, nil
 }
 
 // Serve 在指定监听器上启动 HTTP/2 服务器。
@@ -110,6 +160,7 @@ func (s *Server) Serve(ln net.Listener) error {
 	log := logging.Info()
 	if s.config.Enabled {
 		log.Str("protocol", "h2").
+			Bool("h2c", s.config.H2CEnabled).
 			Bool("push", s.config.PushEnabled).
 			Int("max_streams", s.config.MaxConcurrentStreams).
 			Int("max_header_size", s.config.MaxHeaderListSize).
@@ -139,6 +190,8 @@ func (s *Server) Serve(ln net.Listener) error {
 			continue
 		}
 
+		// 明文连接由 handleConnection 嗅探前导；未命中 h2c 时回退 HTTP/1.1，
+		// 因此独立监听模式下同一端口可同时服务两种协议。
 		s.connWg.Add(1)
 		go s.handleConnection(conn)
 	}
@@ -147,6 +200,7 @@ func (s *Server) Serve(ln net.Listener) error {
 // handleConnection 处理单个连接。
 //
 // 根据连接类型（TLS 或明文）和 ALPN 协商结果，选择合适的协议处理。
+// 明文连接按 HTTP/2 连接前导嗅探，未命中的按 HTTP/1.1 回退给 fasthttp。
 func (s *Server) handleConnection(conn net.Conn) {
 	key := conn.RemoteAddr().String()
 	s.pool.add(key, conn)
@@ -183,25 +237,66 @@ func (s *Server) handleConnection(conn net.Conn) {
 			s.serveHTTP1(tlsConn)
 			return
 		}
+
+		s.serveHTTP2(conn)
+		return
 	}
 
-	// 处理 HTTP/2 连接
-	s.serveHTTP2(conn)
+	// 明文连接：只有以 HTTP/2 前导开头才是 h2c，否则必须按 HTTP/1.1 处理，
+	// 否则同一端口上的普通请求会被当成协议错误全部丢弃。
+	isH2C, sniffed, err := sniffH2C(conn, s.sniffTimeout)
+	if err != nil {
+		logging.Error().Err(err).Msg("HTTP/2 (h2c) preface sniff error")
+		return
+	}
+	if !isH2C {
+		s.serveHTTP1(sniffed)
+		return
+	}
+
+	s.serveHTTP2(sniffed)
 }
 
 // serveHTTP2 使用 HTTP/2 协议服务连接。
 func (s *Server) serveHTTP2(conn net.Conn) {
+	s.serveHTTP2WithUpgrade(conn, nil, nil)
+}
+
+// serveHTTP2WithUpgrade 服务 HTTP/2 连接，可携带 h2c 升级请求与初始 SETTINGS。
+//
+// 参数：
+//   - conn: HTTP/2 连接
+//   - upgradeReq: 被升级的 HTTP/1.1 请求（按 RFC 7540 3.2 即流 1），无则传 nil
+//   - settings: HTTP2-Settings 头部解码后的 SETTINGS 帧负载，无则传 nil
+func (s *Server) serveHTTP2WithUpgrade(conn net.Conn, upgradeReq *http.Request, settings []byte) {
 	adapter := NewFastHTTPHandlerAdapter(s.handler)
 	adapter.MaxBodySize = s.maxBodySize
 	adapter.StreamEnabled = s.streamRequestBody
 
 	opts := &http2.ServeConnOpts{
-		Context:    context.Background(),
-		Handler:    adapter,
-		BaseConfig: &http.Server{},
+		// 用 Server 的上下文：Stop 取消后 x/net/http2 会结束在役连接。
+		Context:        s.connContext(),
+		Handler:        adapter,
+		BaseConfig:     &http.Server{},
+		UpgradeRequest: upgradeReq,
+		Settings:       settings,
 	}
 
 	s.http2Server.ServeConn(conn, opts)
+}
+
+// connContext 返回 ServeConn 使用的连接上下文。
+//
+// 独立 Server 未经 NewServer 构造（如测试里直接取零值）时回退到
+// context.Background()，避免空上下文让 x/net/http2 直接拒绝服务连接。
+//
+// 返回值：
+//   - context.Context: 可被 Stop 取消的连接上下文
+func (s *Server) connContext() context.Context {
+	if s.ctx == nil {
+		return context.Background()
+	}
+	return s.ctx
 }
 
 // serveHTTP1 使用 HTTP/1.1 协议服务连接（回退到 fasthttp）。
@@ -236,7 +331,13 @@ func (s *Server) Stop() error {
 	// 发送停止信号
 	close(s.stopChan)
 
-	// 关闭监听器
+	// 取消连接上下文：x/net/http2 会在 ServeConn 内部监听 ctx.Done，
+	// 借此结束仍活跃的 h2c 长连接，避免 Wait 一直等到空闲超时。
+	if s.cancel != nil {
+		s.cancel()
+	}
+
+	// 关闭监听器（Wrap 模式下监听器由外层 fasthttp 持有并关闭）
 	if s.listener != nil {
 		if err := s.listener.Close(); err != nil {
 			logging.Error().Err(err).Msg("HTTP/2 listener close error")
