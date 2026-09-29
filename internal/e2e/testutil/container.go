@@ -152,7 +152,7 @@ func StartLollyContainer(ctx context.Context, configPath string) (*LollyContaine
 func StartLolly(ctx context.Context, opts ...LollyContainerOption) (*LollyContainer, error) {
 	cfg := &lollyContainerConfig{
 		exposedPorts: []string{"8080/tcp", "8443/tcp"},
-		waitFor:      wait.ForLog("HTTP 服务器启动中").WithStartupTimeout(30 * time.Second),
+		waitFor:      wait.ForLog("Starting HTTP server").WithStartupTimeout(30 * time.Second),
 	}
 
 	for _, opt := range opts {

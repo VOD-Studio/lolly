@@ -18,7 +18,6 @@ import (
 	"context"
 	"io"
 	"net/http"
-	"strings"
 	"testing"
 	"time"
 
@@ -100,13 +99,10 @@ func TestE2EProxyRequestStreaming_ClientMaxBodySize(t *testing.T) {
 		WithServer(":8080").
 		WithProxy("/", pool.InternalAddresses(),
 			testutil.WithProxyRequestBuffering("off"),
+			testutil.WithProxyClientMaxBodySize("1kb"),
 		)
 	configYAML, err := cfg.Build()
 	require.NoError(t, err)
-	// 在第一个 proxy 块中追加 client_max_body_size
-	configYAML = strings.Replace(configYAML,
-		"    load_balance: round_robin\n",
-		"    load_balance: round_robin\n    client_max_body_size: \"1kb\"\n", 1)
 
 	lolly, err := testutil.StartLolly(ctx, testutil.WithConfigYAML(configYAML), testutil.WithNetwork(networkName))
 	require.NoError(t, err, "Failed to start lolly")

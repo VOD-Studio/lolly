@@ -183,6 +183,15 @@ func WithProxyRequestBuffering(mode string) ProxyOption {
 	}
 }
 
+// WithProxyClientMaxBodySize 设置代理路径的请求体大小限制。
+//
+// 与 nginx client_max_body_size 语义一致：超限返回 413，"0" 表示不限制。
+func WithProxyClientMaxBodySize(size string) ProxyOption {
+	return func(p *config.ProxyConfig) {
+		p.ClientMaxBodySize = size
+	}
+}
+
 // WithProxyNextUpstream 设置故障转移。
 func WithProxyNextUpstream(tries int, httpCodes []int) ProxyOption {
 	return func(p *config.ProxyConfig) {
