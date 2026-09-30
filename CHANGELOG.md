@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+#### Static
+
+- **handler**: 静态文件支持单区间 HTTP Range 请求（RFC 9110），响应 `Accept-Ranges: bytes`
+  - `bytes=a-b`、`bytes=a-`、`bytes=-n` 返回 206 + `Content-Range`；无法满足返回 416 + `Content-Range: bytes */size`
+  - 支持 `If-Range`（强 ETag / `Last-Modified` 日期），不匹配时回退完整 200
+  - 多区间、非 bytes 单位、语法非法的 Range 被忽略（返回完整 200）；仅对 GET/HEAD 生效
+  - 内存读取、文件缓存、sendfile 路径均支持；sendfile 区间仍走零拷贝
+  - 存在 Range 时不使用预压缩文件，压缩中间件不压缩 206 响应；被压缩的 200 响应会移除 `Accept-Ranges`
+
 #### Proxy
 
 - **proxy**: 请求体流式反代（`buffering.request_mode: off`），对齐 nginx `proxy_request_buffering off`

@@ -14,12 +14,14 @@
 //   - 自动处理目录遍历攻击防护
 //   - 支持多索引文件（如 index.html、index.htm）
 //   - 支持预压缩 .gz 文件
+//   - 支持单区间 Range 请求（206/416，见 range.go）
 //
 // 作者：xfy
 package handler
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -436,19 +438,29 @@ func (h *StaticHandler) tryServeFromFileCache(ctx *fasthttp.RequestCtx, filePath
 		return false
 	}
 
+	// respond 写入缓存内容，按 Range 请求截取（206/416）。
+	respond := func() {
+		spec := evalRange(ctx, int64(len(entry.Data)), entry.ETag, info.ModTime())
+		ctx.Response.Header.SetContentType(entry.ContentType)
+		ctx.Response.Header.Set("ETag", entry.ETag)
+		ctx.Response.Header.Set("Last-Modified", info.ModTime().UTC().Format(httpTimeFormat))
+		spec.apply(ctx)
+		if spec.state != rangeUnsatisfiable {
+			ctx.Response.SetBody(spec.slice(entry.Data))
+		}
+	}
+
 	// TTL 验证（cacheTTL > 0 时启用）
 	if h.cacheTTL > 0 && time.Since(entry.CachedAt) < h.cacheTTL {
 		if isNotModified(ctx, entry.ETag, info.ModTime()) {
 			ctx.Response.SetStatusCode(fasthttp.StatusNotModified)
 			ctx.Response.Header.Set("ETag", entry.ETag)
 			ctx.Response.Header.Set("Last-Modified", info.ModTime().UTC().Format(httpTimeFormat))
+			ctx.Response.Header.Set("Accept-Ranges", "bytes")
 			ctx.Response.SkipBody = true
 			return true
 		}
-		ctx.Response.SetBody(entry.Data)
-		ctx.Response.Header.SetContentType(entry.ContentType)
-		ctx.Response.Header.Set("ETag", entry.ETag)
-		ctx.Response.Header.Set("Last-Modified", info.ModTime().UTC().Format(httpTimeFormat))
+		respond()
 		return true
 	}
 
@@ -458,16 +470,14 @@ func (h *StaticHandler) tryServeFromFileCache(ctx *fasthttp.RequestCtx, filePath
 			ctx.Response.SetStatusCode(fasthttp.StatusNotModified)
 			ctx.Response.Header.Set("ETag", entry.ETag)
 			ctx.Response.Header.Set("Last-Modified", info.ModTime().UTC().Format(httpTimeFormat))
+			ctx.Response.Header.Set("Accept-Ranges", "bytes")
 			ctx.Response.SkipBody = true
 			return true
 		}
 		if h.cacheTTL > 0 {
 			h.fileCache.RefreshCachedAt(filePath)
 		}
-		ctx.Response.SetBody(entry.Data)
-		ctx.Response.Header.SetContentType(entry.ContentType)
-		ctx.Response.Header.Set("ETag", entry.ETag)
-		ctx.Response.Header.Set("Last-Modified", info.ModTime().UTC().Format(httpTimeFormat))
+		respond()
 		return true
 	}
 
@@ -705,13 +715,27 @@ func (h *StaticHandler) serveFile(ctx *fasthttp.RequestCtx, filePath string, inf
 		ctx.Response.SetStatusCode(fasthttp.StatusNotModified)
 		ctx.Response.Header.Set("ETag", etag)
 		ctx.Response.Header.Set("Last-Modified", info.ModTime().UTC().Format(httpTimeFormat))
+		ctx.Response.Header.Set("Accept-Ranges", "bytes")
 		h.setCacheHeaders(ctx)
 		ctx.Response.SkipBody = true
 		return
 	}
 
-	// 尝试发送预压缩文件
-	if h.gzipStatic != nil {
+	// 评估 Range 请求（条件请求之后、内容选择之前）。
+	// Range 始终作用于未压缩内容，因此区间不可满足时直接 416，
+	// 有 Range 请求时也不使用预压缩文件（见下）。
+	spec := evalRange(ctx, info.Size(), etag, info.ModTime())
+	if spec.state == rangeUnsatisfiable {
+		ctx.Response.Header.Set("ETag", etag)
+		ctx.Response.Header.Set("Last-Modified", info.ModTime().UTC().Format(httpTimeFormat))
+		spec.apply(ctx)
+		return
+	}
+
+	// 尝试发送预压缩文件。
+	// 存在 Range 请求时跳过：预压缩文件是另一种编码表示，其字节偏移与原文件不同，
+	// 直接对其应用 Range 会得到与 ETag/Content-Length 不一致的数据。
+	if h.gzipStatic != nil && !hasRangeRequest(ctx) {
 		relPath := strings.TrimPrefix(filePath, h.root)
 		if h.gzipStatic.ServeFile(ctx, relPath) {
 			// 预压缩文件已发送，补充验证头
@@ -729,11 +753,12 @@ func (h *StaticHandler) serveFile(ctx *fasthttp.RequestCtx, filePath string, inf
 			if entry.ModTime.Equal(info.ModTime()) {
 				// 缓存命中且文件未修改
 				// 使用缓存的 ETag 和 ContentType，避免重新生成
-				ctx.Response.SetBody(entry.Data)
 				ctx.Response.Header.SetContentType(entry.ContentType)
 				ctx.Response.Header.Set("ETag", entry.ETag)
 				ctx.Response.Header.Set("Last-Modified", info.ModTime().UTC().Format(httpTimeFormat))
 				h.setCacheHeaders(ctx)
+				spec.apply(ctx)
+				ctx.Response.SetBody(spec.slice(entry.Data))
 				return
 			}
 			// 文件已修改，删除旧缓存
@@ -747,18 +772,32 @@ func (h *StaticHandler) serveFile(ctx *fasthttp.RequestCtx, filePath string, inf
 	// 2. Flush HTTP 头到 socket（关键步骤）
 	// 3. copyZeroAlloc → ReadFrom → sendfile
 	// 这样保证 HTTP 头先发送，避免顺序错乱导致的 "200 0" malformed response
+	// Range 请求同样走该路径，由 rangeFileReader 限定偏移与长度（仍可 sendfile）。
 	if h.useSendfile && info.Size() >= MinSendfileSize {
-		ctx.Response.Header.SetContentType(mimeutil.DetectContentType(filePath))
-		ctx.Response.Header.Set("ETag", etag)
-		ctx.Response.Header.Set("Last-Modified", info.ModTime().UTC().Format(httpTimeFormat))
-		h.setCacheHeaders(ctx)
-
 		file, err := os.Open(filePath)
 		if err == nil {
-			// SetBodyStream 会在 handler 返回后由 fasthttp 统一处理
-			// HTTP 头写入、Flush 和 sendfile 的顺序
-			ctx.Response.SetBodyStream(file, int(info.Size()))
-			return
+			var body io.Reader = file
+			bodySize := info.Size()
+			if spec.state == rangePartial {
+				rr, rerr := newRangeFileReader(file, spec.start, spec.length)
+				if rerr != nil {
+					_ = file.Close()
+					file = nil
+				} else {
+					body, bodySize = rr, spec.length
+				}
+			}
+			if file != nil {
+				ctx.Response.Header.SetContentType(mimeutil.DetectContentType(filePath))
+				ctx.Response.Header.Set("ETag", etag)
+				ctx.Response.Header.Set("Last-Modified", info.ModTime().UTC().Format(httpTimeFormat))
+				h.setCacheHeaders(ctx)
+				spec.apply(ctx)
+				// SetBodyStream 会在 handler 返回后由 fasthttp 统一处理
+				// HTTP 头写入、Flush 和 sendfile 的顺序
+				ctx.Response.SetBodyStream(body, int(bodySize))
+				return
+			}
 		}
 	}
 
@@ -769,17 +808,27 @@ func (h *StaticHandler) serveFile(ctx *fasthttp.RequestCtx, filePath string, inf
 		return
 	}
 
-	// 存入缓存（仅对小文件缓存）
+	// 存入缓存（仅对小文件缓存，缓存的始终是完整内容）
 	contentType := mimeutil.DetectContentType(filePath)
 	if h.fileCache != nil && info.Size() < 1024*1024 { // < 1MB
 		_ = h.fileCache.Set(filePath, data, info.Size(), info.ModTime(), contentType)
 	}
 
-	ctx.Response.SetBody(data)
+	// 文件在 stat 之后被截断/替换时，按实际读取长度重新评估 Range
+	if int64(len(data)) != info.Size() {
+		spec = evalRange(ctx, int64(len(data)), etag, info.ModTime())
+		if spec.state == rangeUnsatisfiable {
+			spec.apply(ctx)
+			return
+		}
+	}
+
 	ctx.Response.Header.SetContentType(contentType)
 	ctx.Response.Header.Set("ETag", etag)
 	ctx.Response.Header.Set("Last-Modified", info.ModTime().UTC().Format(httpTimeFormat))
 	h.setCacheHeaders(ctx)
+	spec.apply(ctx)
+	ctx.Response.SetBody(spec.slice(data))
 }
 
 // setCacheHeaders 设置缓存控制响应头。
