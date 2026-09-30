@@ -1011,11 +1011,33 @@ func (h *StaticHandler) representationETag(ctx *fasthttp.RequestCtx, etag, fileP
 // 其余情形（预压缩、Range、无压缩中间件、流式压缩路径）预测是精确的，不涉及推迟。
 func notModifiedForRepresentation(ctx *fasthttp.RequestCtx, idTag, respTag string, mayFallBack bool, modTime time.Time) bool {
 	if isNotModified(ctx, respTag, modTime) {
+		if mayFallBack && respTag != idTag && representationAgnostic(ctx) {
+			// If-None-Match: * 或仅 If-Modified-Since 命中：条件与具体表示无关，但 304 必须带上
+			// 200 本会携带的 ETag，而最终表示（压缩变体 / 回退的 identity）此时未知，
+			// 交由压缩中间件在确定后改写。点名了压缩变体 ETag 的命中则直接 304（该标签只可能来自真正压缩过的响应）。
+			compression.DeferNotModified(ctx)
+			return false
+		}
 		return true
 	}
 	if mayFallBack && respTag != idTag && ctx.Request.Header.Peek("If-None-Match") != nil &&
 		isNotModified(ctx, idTag, modTime) {
 		compression.DeferRevalidation(ctx, idTag)
+	}
+	return false
+}
+
+// representationAgnostic 报告条件请求的命中是否与具体表示（ETag）无关：
+// 没有 If-None-Match（由 If-Modified-Since 决定），或 If-None-Match 含 "*"。
+func representationAgnostic(ctx *fasthttp.RequestCtx) bool {
+	match := ctx.Request.Header.Peek("If-None-Match")
+	if len(match) == 0 {
+		return true
+	}
+	for tag := range strings.SplitSeq(string(match), ",") {
+		if strings.TrimSpace(tag) == "*" {
+			return true
+		}
 	}
 	return false
 }
@@ -1034,7 +1056,9 @@ func isNotModified(ctx *fasthttp.RequestCtx, etag string, modTime time.Time) boo
 	if match := ctx.Request.Header.Peek("If-None-Match"); len(match) > 0 {
 		// RFC 9110: If-None-Match = #entity-tag，逗号分隔
 		for tag := range strings.SplitSeq(string(match), ",") {
-			if weakETagMatch(strings.TrimSpace(tag), etag) {
+			tag = strings.TrimSpace(tag)
+			// "*" 匹配任何当前存在的表示（RFC 9110 13.1.2），GET/HEAD 命中时应答 304。
+			if tag == "*" || weakETagMatch(tag, etag) {
 				return true
 			}
 		}
