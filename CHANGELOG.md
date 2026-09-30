@@ -14,9 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **handler**: 静态文件支持单区间 HTTP Range 请求（RFC 9110），响应 `Accept-Ranges: bytes`
   - `bytes=a-b`、`bytes=a-`、`bytes=-n` 返回 206 + `Content-Range`；无法满足返回 416 + `Content-Range: bytes */size`
   - 支持 `If-Range`（强 ETag / `Last-Modified` 日期），不匹配时回退完整 200
-  - 多区间、非 bytes 单位、语法非法的 Range 被忽略（返回完整 200）；仅对 GET/HEAD 生效
+  - 多区间、非 bytes 单位、语法非法的 Range 被忽略（返回完整 200）；仅对 GET 生效，HEAD 等其他方法忽略 Range（RFC 9110 14.2），返回 200 与完整元数据
   - 内存读取、文件缓存、sendfile 路径均支持；sendfile 区间仍走零拷贝
   - 存在 Range 时不使用预压缩文件，压缩中间件不压缩 206 响应；被压缩的 200 响应会移除 `Accept-Ranges`
+  - 不同内容编码的表示使用不同的强 ETag：压缩响应（动态 gzip/br 与预压缩 `.gz`/`.br`）ETag 追加编码后缀，如 `"abc-gzip"`；`If-Range` 仅与未压缩表示的 ETag 比较，携带压缩变体 ETag 时回退完整 200，避免拼接出损坏文件；`If-None-Match` 命中 identity 或压缩变体 ETag 均返回 304
 
 #### Proxy
 
