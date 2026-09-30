@@ -13,7 +13,7 @@
 
 ### 核心功能
 
-- **静态文件服务** - 零拷贝传输（sendfile）、文件缓存、预压缩支持、try_files 配置、ETag 和 304 Not Modified
+- **静态文件服务** - 零拷贝传输（sendfile）、文件缓存、预压缩支持、try_files 配置、ETag 和 304 Not Modified、单区间 Range（206/416）
 - **反向代理** - 请求头/响应头修改、超时控制、故障转移（next_upstream）、Location/Refresh 头改写
 - **HTTP/2** - 完整的 HTTP/2 服务器支持，包含适配器与流控；TLS 上经 ALPN 协商，明文端口可启用 h2c（prior knowledge 与 Upgrade 握手）
 - **HTTP/3 (QUIC)** - 基于 quic-go，支持 0-RTT 连接

@@ -251,6 +251,13 @@ func (m *Middleware) Process(next fasthttp.RequestHandler) fasthttp.RequestHandl
 			return
 		}
 
+		// 206 Partial Content 的 Content-Range 描述的是未压缩内容的字节区间，
+		// 压缩后区间语义将失效，因此不压缩部分内容响应（同时避免读取整个 body 流）。
+		if ctx.Response.StatusCode() == fasthttp.StatusPartialContent ||
+			len(ctx.Response.Header.Peek("Content-Range")) > 0 {
+			return
+		}
+
 		// 获取响应体
 		body := ctx.Response.Body()
 		bodyLen := len(body)
@@ -276,6 +283,8 @@ func (m *Middleware) Process(next fasthttp.RequestHandler) fasthttp.RequestHandl
 
 		if bodyLen > streamingThreshold {
 			// 大响应：流式压缩，消除 compressed buffer 分配
+			// 压缩后的表示无法按原始字节区间寻址，撤销 Accept-Ranges 声明
+			ctx.Response.Header.Del("Accept-Ranges")
 			if useBrotli {
 				m.streamWithPool(ctx, encoding, m.brotliPool)
 			} else if useGzip {
@@ -295,6 +304,7 @@ func (m *Middleware) Process(next fasthttp.RequestHandler) fasthttp.RequestHandl
 				ctx.Response.SetBody(compressed)
 				ctx.Response.Header.Set("Content-Encoding", encoding)
 				ctx.Response.Header.Del("Content-Length")
+				ctx.Response.Header.Del("Accept-Ranges")
 			}
 		}
 	}
