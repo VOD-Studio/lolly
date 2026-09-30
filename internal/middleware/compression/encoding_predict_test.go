@@ -141,3 +141,58 @@ func TestMiddlewareDeferredRevalidation(t *testing.T) {
 		t.Errorf("非 200 不应改写")
 	}
 }
+
+// TestMiddlewareDeferredNotModified 与表示无关的条件（If-None-Match: * / 仅 If-Modified-Since）被推迟后：
+// 压缩发生 -> 304 回显压缩变体 ETag；压缩被放弃 -> 304 回显 identity ETag；均无 Content-Encoding/正文；
+// 未登记推迟 / 非 200 时不改写。
+func TestMiddlewareDeferredNotModified(t *testing.T) {
+	mw, err := New(&config.CompressionConfig{Type: "gzip", Level: 6, MinSize: 10, Types: []string{"text/plain"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	random := make([]byte, 300)
+	x := uint64(88172645463325252)
+	for i := range random {
+		x ^= x << 13
+		x ^= x >> 7
+		x ^= x << 17
+		random[i] = byte(x >> 24)
+	}
+	text := make([]byte, 300)
+	for i := range text {
+		text[i] = 'a'
+	}
+	run := func(body []byte, deferNM bool, status int) *fasthttp.RequestCtx {
+		ctx := &fasthttp.RequestCtx{}
+		ctx.Request.Header.Set("Accept-Encoding", "gzip")
+		mw.Process(func(c *fasthttp.RequestCtx) {
+			if deferNM {
+				DeferNotModified(c)
+			}
+			c.Response.SetStatusCode(status)
+			c.Response.Header.SetContentType("text/plain")
+			c.Response.Header.Set("ETag", `"abc"`)
+			c.Response.Header.Set("Last-Modified", "Wed, 30 Sep 2026 00:00:00 GMT")
+			c.Response.Header.Set("Cache-Control", "public, max-age=60")
+			c.Response.SetBody(body)
+		})(ctx)
+		return ctx
+	}
+	check := func(name string, ctx *fasthttp.RequestCtx, wantTag string) {
+		t.Helper()
+		if ctx.Response.StatusCode() != 304 || len(ctx.Response.Body()) != 0 ||
+			string(ctx.Response.Header.Peek("ETag")) != wantTag ||
+			len(ctx.Response.Header.Peek("Content-Encoding")) != 0 ||
+			len(ctx.Response.Header.Peek("Last-Modified")) == 0 || len(ctx.Response.Header.Peek("Cache-Control")) == 0 {
+			t.Errorf("%s: 期望 304 + ETag %s + 保留 Last-Modified/Cache-Control: %d %q", name, wantTag, ctx.Response.StatusCode(), ctx.Response.Header.String())
+		}
+	}
+	check("压缩发生", run(text, true, 200), `"abc-gzip"`)
+	check("压缩被放弃", run(random, true, 200), `"abc"`)
+	if ctx := run(text, false, 200); ctx.Response.StatusCode() != 200 || string(ctx.Response.Header.Peek("Content-Encoding")) != "gzip" {
+		t.Errorf("未登记推迟不应改写: %d", ctx.Response.StatusCode())
+	}
+	if ctx := run(random, true, 404); ctx.Response.StatusCode() != 404 {
+		t.Errorf("非 200 不应改写: %d", ctx.Response.StatusCode())
+	}
+}

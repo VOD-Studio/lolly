@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - 内存读取、文件缓存、sendfile 路径均支持；sendfile 区间仍走零拷贝
   - 存在 Range 时不使用预压缩文件，压缩中间件不压缩 206 响应；被压缩的 200 响应会移除 `Accept-Ranges`
   - 不同内容编码的表示使用不同的强 ETag：压缩响应（动态 gzip/br 与预压缩 `.gz`/`.br`）ETag 追加编码后缀，如 `"abc-gzip"`；`If-Range` 仅与未压缩表示的 ETag 比较，携带压缩变体 ETag 时回退完整 200，避免拼接出损坏文件；`If-None-Match` 只与本次响应实际选用表示的 ETag 比较（identity 标签不匹配压缩表示，反之亦然），命中返回 304
+  - `If-None-Match: *` 与仅 `If-Modified-Since` 命中时同样返回 304，且回显最终表示的 ETag（压缩变体或回退后的 identity）；流式压缩（>64KB）复制正文再交给流写入 goroutine，避免与 fasthttp 缓冲池复用产生数据竞争
 
 #### Proxy
 

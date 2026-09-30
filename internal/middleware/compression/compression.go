@@ -285,10 +285,14 @@ func (m *Middleware) Process(next fasthttp.RequestHandler) fasthttp.RequestHandl
 				setEncodedETag(ctx, encoding)
 				ctx.Response.Header.Del("Content-Length")
 				ctx.Response.Header.Del("Accept-Ranges")
+				// 与表示无关的条件（If-None-Match: * / 仅 If-Modified-Since）命中：
+				// 按压缩后的表示（变体 ETag）返回 304。
+				completeDeferredNotModified(ctx)
 			} else {
 				// 压缩后体积没有变小，放弃压缩，最终表示是 identity。
-				// 下游若因此推迟了 If-None-Match 的判定，在这里按最终表示补上。
+				// 下游若因此推迟了条件请求的判定，在这里按最终表示补上。
 				completeDeferredRevalidation(ctx)
+				completeDeferredNotModified(ctx)
 			}
 		}
 	}
@@ -328,9 +332,34 @@ func completeDeferredRevalidation(ctx *fasthttp.RequestCtx) {
 		string(ctx.Response.Header.Peek("ETag")) != etag {
 		return
 	}
+	rewriteNotModified(ctx)
+}
+
+// NotModifiedKey 是下游处理器登记“条件已满足但与具体表示无关”的键（值为 true）。
+const NotModifiedKey = "lolly.compression.notmodified"
+
+// DeferNotModified 让下游处理器把“与表示无关的条件”（If-None-Match: * 或仅 If-Modified-Since 命中）
+// 的 304 响应推迟给压缩中间件：处理器无法预知压缩会发生还是被放弃，而 304 必须带上
+// 200 本会携带的 ETag。中间件在确定最终表示（压缩变体或 identity）后再改写为 304，ETag 因此准确。
+func DeferNotModified(ctx *fasthttp.RequestCtx) {
+	ctx.SetUserValue(NotModifiedKey, true)
+}
+
+// completeDeferredNotModified 兑现 DeferNotModified：最终响应仍为 200 时改写为 304。
+func completeDeferredNotModified(ctx *fasthttp.RequestCtx) {
+	if v, _ := ctx.UserValue(NotModifiedKey).(bool); !v || ctx.Response.StatusCode() != fasthttp.StatusOK {
+		return
+	}
+	rewriteNotModified(ctx)
+}
+
+// rewriteNotModified 把 200 响应改写为 304：保留 ETag、Last-Modified、Cache-Control 等验证/缓存头，
+// 丢弃正文以及仅对正文有意义的 Content-Encoding/Content-Length/Content-Type。
+func rewriteNotModified(ctx *fasthttp.RequestCtx) {
 	ctx.Response.SetStatusCode(fasthttp.StatusNotModified)
 	ctx.Response.ResetBody()
 	ctx.Response.SkipBody = true
+	ctx.Response.Header.Del("Content-Encoding")
 	ctx.Response.Header.Del("Content-Length")
 	ctx.Response.Header.Del("Content-Type")
 }
@@ -464,7 +493,10 @@ func (m *Middleware) streamWithPool(ctx *fasthttp.RequestCtx, encoding string, p
 	setEncodedETag(ctx, encoding)
 	ctx.Response.Header.Del("Content-Length") // 使用 chunked encoding
 
-	body := ctx.Response.Body()
+	// SetBodyStreamWriter 内部会 ResetBody：未启用 keepBodyBuffer（如 reduce_memory_usage: true）时，
+	// 原 body 缓冲区被归还 fasthttp 的池，而流式 goroutine 稍后才读取它，会与其他请求复用该缓冲区产生数据竞争。
+	// 因此在重置前复制一份，由闭包独占。
+	body := bytes.Clone(ctx.Response.Body())
 	ctx.SetBodyStreamWriter(func(w *bufio.Writer) {
 		writer, ok := pool.Get()
 		if !ok {
