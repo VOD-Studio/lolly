@@ -220,28 +220,20 @@ func (m *Middleware) Name() string {
 //   - fasthttp.RequestHandler: 包装后的请求处理器
 func (m *Middleware) Process(next fasthttp.RequestHandler) fasthttp.RequestHandler {
 	return func(ctx *fasthttp.RequestCtx) {
-		// 检查客户端是否支持压缩（零拷贝使用 []byte）
-		acceptEncoding := ctx.Request.Header.Peek("Accept-Encoding")
+		// 让下游处理器（如静态文件）能够预测本中间件对响应的压缩决定，
+		// 以便在条件请求（If-None-Match）中比较正确表示的 ETag。
+		ctx.SetUserValue(ContextKey, m)
 
-		// 根据算法和客户端支持选择压缩方式
-		var useGzip, useBrotli bool
-		switch m.algorithm {
-		case AlgorithmGzip:
-			useGzip = bytes.Contains(acceptEncoding, []byte("gzip"))
-		case AlgorithmBrotli:
-			// brotli 或 both 模式
-			if bytes.Contains(acceptEncoding, []byte("br")) {
-				useBrotli = true
-			} else if bytes.Contains(acceptEncoding, []byte("gzip")) {
-				useGzip = true
-			}
-		}
+		// 检查客户端是否支持压缩（零拷贝使用 []byte）并选择压缩方式
+		encoding := m.negotiate(ctx.Request.Header.Peek("Accept-Encoding"))
 
 		// 如果不需要压缩，直接执行
-		if !useGzip && !useBrotli {
+		if encoding == "" {
 			next(ctx)
 			return
 		}
+		useBrotli := encoding == "br"
+		useGzip := encoding == compressionGZIP
 
 		// 执行处理器
 		next(ctx)
@@ -263,23 +255,9 @@ func (m *Middleware) Process(next fasthttp.RequestHandler) fasthttp.RequestHandl
 		body := ctx.Response.Body()
 		bodyLen := len(body)
 
-		// 检查是否满足压缩条件
-		if bodyLen < m.minSize {
+		// 检查是否满足压缩条件（最小长度、MIME 类型；零拷贝使用 []byte）
+		if !m.shouldCompress(ctx.Response.Header.ContentType(), bodyLen) {
 			return // 不压缩
-		}
-
-		// 检查 MIME 类型（零拷贝使用 []byte）
-		contentType := ctx.Response.Header.ContentType()
-		if !m.isCompressible(contentType) {
-			return // 不压缩此类型
-		}
-
-		// 执行压缩
-		var encoding string
-		if useBrotli {
-			encoding = "br"
-		} else if useGzip {
-			encoding = compressionGZIP
 		}
 
 		if bodyLen > streamingThreshold {
@@ -310,6 +288,52 @@ func (m *Middleware) Process(next fasthttp.RequestHandler) fasthttp.RequestHandl
 			}
 		}
 	}
+}
+
+// ContextKey 是压缩中间件在 RequestCtx.UserValue 中登记自身的键。
+//
+// 中间件在调用下游处理器之前写入 *Middleware，处理器可通过 PredictEncoding
+// 得知本次响应是否会被压缩，从而在压缩发生之前就用正确表示的 ETag 评估条件请求。
+const ContextKey = "lolly.compression"
+
+// negotiate 根据配置的算法与客户端 Accept-Encoding 选择编码，
+// 返回 "gzip"、"br"，客户端不支持时返回空字符串。
+func (m *Middleware) negotiate(acceptEncoding []byte) string {
+	switch m.algorithm {
+	case AlgorithmGzip:
+		if bytes.Contains(acceptEncoding, []byte("gzip")) {
+			return compressionGZIP
+		}
+	case AlgorithmBrotli:
+		// brotli 或 both 模式
+		if bytes.Contains(acceptEncoding, []byte("br")) {
+			return "br"
+		}
+		if bytes.Contains(acceptEncoding, []byte("gzip")) {
+			return compressionGZIP
+		}
+	}
+	return ""
+}
+
+// shouldCompress 判断给定长度与 MIME 类型的响应体是否满足压缩条件。
+func (m *Middleware) shouldCompress(contentType []byte, bodyLen int) bool {
+	return bodyLen >= m.minSize && m.isCompressible(contentType)
+}
+
+// PredictEncoding 预测 Process 对一个未编码、非部分内容（非 206）的 200 响应
+// 会选择的内容编码，返回 "gzip"、"br"，预计不压缩时返回空字符串。
+//
+// 它与 Process 使用同一套决策（Accept-Encoding 协商、最小长度、MIME 类型），
+// 但无法预知压缩后体积是否反而变大（此时 Process 会放弃压缩），
+// 因此预测的是“尝试压缩”的编码。调用方需自行排除已带 Content-Encoding、
+// 或会产生 206/416（Range）的响应。
+func (m *Middleware) PredictEncoding(acceptEncoding, contentType []byte, bodyLen int) string {
+	encoding := m.negotiate(acceptEncoding)
+	if encoding == "" || !m.shouldCompress(contentType, bodyLen) {
+		return ""
+	}
+	return encoding
 }
 
 // setEncodedETag 为压缩后的表示改写强 ETag，使其区别于未压缩表示。

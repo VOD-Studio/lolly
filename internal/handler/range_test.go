@@ -13,11 +13,13 @@ import (
 	"bufio"
 	"bytes"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -540,24 +542,207 @@ func TestStaticIfRange_IdentityETagPartial(t *testing.T) {
 	}
 }
 
-// TestStaticIfNoneMatch_EncodingVariants If-None-Match 携带 identity 或压缩变体 ETag 均返回 304，
-// 且 304 回显客户端持有的那个 ETag。
-func TestStaticIfNoneMatch_EncodingVariants(t *testing.T) {
-	handler, _ := newCompressedStatic(t, 300, false)
-	idTag := string(doChain(handler, "GET", nil).Response.Header.Peek("ETag"))
-	gzTag := string(doChain(handler, "GET", map[string]string{"Accept-Encoding": "gzip"}).Response.Header.Peek("ETag"))
-	for _, tag := range []string{idTag, gzTag} {
-		ctx := doChain(handler, "GET", map[string]string{"Accept-Encoding": "gzip", "If-None-Match": tag})
-		if ctx.Response.StatusCode() != fasthttp.StatusNotModified {
-			t.Errorf("If-None-Match %q: status = %d, want 304", tag, ctx.Response.StatusCode())
-		}
-		if got := string(ctx.Response.Header.Peek("ETag")); got != tag {
-			t.Errorf("304 ETag = %q, want %q", got, tag)
-		}
+// encStaticOpts 配置 newEncStatic 构造的“静态处理器 + 压缩中间件”链。
+type encStaticOpts struct {
+	size       int      // f.txt 大小
+	gz, br     bool     // 是否提供预压缩 f.txt.gz / f.txt.br
+	algorithm  string   // 压缩中间件类型："gzip"（默认）或 "both"
+	minSize    int      // 压缩中间件 min_size（默认 10）
+	types      []string // 可压缩 MIME（默认 text/plain）
+	fileCache  bool     // 启用文件缓存（覆盖 tryServeFromFileCache 路径）
+	noCompress bool     // 链上不放压缩中间件
+}
+
+// newEncStatic 构造静态处理器（可选预压缩文件、文件缓存）并包上压缩中间件。
+func newEncStatic(t *testing.T, o encStaticOpts) fasthttp.RequestHandler {
+	t.Helper()
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "f.txt"), rangeFixture(o.size), 0o644); err != nil {
+		t.Fatal(err)
 	}
-	ctx := doChain(handler, "GET", map[string]string{"If-None-Match": `"other"`})
-	if ctx.Response.StatusCode() != fasthttp.StatusOK {
-		t.Errorf("mismatched If-None-Match: status = %d, want 200", ctx.Response.StatusCode())
+	h := NewStaticHandler(root, "/", nil, false)
+	var exts []string
+	if o.gz {
+		if err := os.WriteFile(filepath.Join(root, "f.txt.gz"), []byte("FAKE-GZIP-CONTENT"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		exts = append(exts, ".gz")
+	}
+	if o.br {
+		if err := os.WriteFile(filepath.Join(root, "f.txt.br"), []byte("FAKE-BR-CONTENT"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		exts = append([]string{".br"}, exts...)
+	}
+	if len(exts) > 0 {
+		h.SetGzipStatic(true, []string{".txt"}, exts)
+	}
+	if o.fileCache {
+		h.SetFileCache(cache.NewFileCache(100, 1<<20, time.Minute))
+		h.SetCacheTTL(time.Minute)
+	}
+	if o.noCompress {
+		return h.Handle
+	}
+	if o.algorithm == "" {
+		o.algorithm = "gzip"
+	}
+	if o.minSize == 0 {
+		o.minSize = 10
+	}
+	if o.types == nil {
+		o.types = []string{"text/plain"}
+	}
+	mw, err := compression.New(&config.CompressionConfig{Type: o.algorithm, Level: 6, MinSize: o.minSize, Types: o.types})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return mw.Process(h.Handle)
+}
+
+// TestStaticIfNoneMatch_EncodingMatrix If-None-Match 只与本次响应实际选用的表示的 ETag 比较：
+//
+//	identity 请求 + identity 标签 -> 304（回显 identity ETag）
+//	identity 请求 + 压缩标签      -> 200（identity 正文，ETag 为 identity）
+//	压缩请求     + 压缩标签      -> 304（回显压缩 ETag）
+//	压缩请求     + identity 标签 -> 200（压缩正文，ETag 为压缩变体）
+func TestStaticIfNoneMatch_EncodingMatrix(t *testing.T) {
+	cases := []struct {
+		name string
+		opts encStaticOpts
+		enc  string // 压缩请求的 Accept-Encoding
+		want string // 期望的 Content-Encoding
+	}{
+		{"动态gzip", encStaticOpts{size: 300}, "gzip", "gzip"},
+		{"动态gzip/文件缓存", encStaticOpts{size: 300, fileCache: true}, "gzip", "gzip"},
+		{"动态br", encStaticOpts{size: 300, algorithm: "both"}, "br, gzip", "br"},
+		{"预压缩gz", encStaticOpts{size: 300, gz: true}, "gzip", "gzip"},
+		{"预压缩br", encStaticOpts{size: 300, gz: true, br: true}, "br, gzip", "br"},
+		{"预压缩gz/文件缓存", encStaticOpts{size: 300, gz: true, fileCache: true}, "gzip", "gzip"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			handler := newEncStatic(t, tc.opts)
+			// 文件缓存路径需要先预热一次，后续请求才会走 tryServeFromFileCache。
+			doChain(handler, "GET", nil)
+
+			id := doChain(handler, "GET", nil)
+			idTag := string(id.Response.Header.Peek("ETag"))
+			encHdr := map[string]string{"Accept-Encoding": tc.enc}
+			ec := doChain(handler, "GET", encHdr)
+			encTag := string(ec.Response.Header.Peek("ETag"))
+			if got := string(ec.Response.Header.Peek("Content-Encoding")); got != tc.want {
+				t.Fatalf("Content-Encoding = %q, want %q", got, tc.want)
+			}
+			if idTag == "" || encTag == "" || idTag == encTag {
+				t.Fatalf("ETag 应存在且不同: identity=%q encoded=%q", idTag, encTag)
+			}
+			wantEncTag := idTag[:len(idTag)-1] + "-" + tc.want + `"`
+			if encTag != wantEncTag {
+				t.Fatalf("encoded ETag = %q, want %q", encTag, wantEncTag)
+			}
+
+			with := func(hdr map[string]string, inm string) *fasthttp.RequestCtx {
+				h := map[string]string{"If-None-Match": inm}
+				maps.Copy(h, hdr)
+				return doChain(handler, "GET", h)
+			}
+			check := func(name string, ctx *fasthttp.RequestCtx, status int, wantTag, wantCE string) {
+				t.Helper()
+				if got := ctx.Response.StatusCode(); got != status {
+					t.Errorf("%s: status = %d, want %d", name, got, status)
+				}
+				if got := string(ctx.Response.Header.Peek("ETag")); got != wantTag {
+					t.Errorf("%s: ETag = %q, want %q", name, got, wantTag)
+				}
+				if got := string(ctx.Response.Header.Peek("Content-Encoding")); status == fasthttp.StatusOK && got != wantCE {
+					t.Errorf("%s: Content-Encoding = %q, want %q", name, got, wantCE)
+				}
+				if status == fasthttp.StatusNotModified && len(ctx.Response.Body()) != 0 {
+					t.Errorf("%s: 304 不应有正文", name)
+				}
+			}
+			check("identity请求+identity标签", with(nil, idTag), fasthttp.StatusNotModified, idTag, "")
+			check("identity请求+压缩标签", with(nil, encTag), fasthttp.StatusOK, idTag, "")
+			check("压缩请求+压缩标签", with(encHdr, encTag), fasthttp.StatusNotModified, encTag, "")
+			check("压缩请求+identity标签", with(encHdr, idTag), fasthttp.StatusOK, encTag, tc.want)
+			// 标签列表：命中其中任一个即可（弱比较忽略 W/ 前缀）
+			check("压缩请求+列表含压缩标签", with(encHdr, idTag+", "+encTag), fasthttp.StatusNotModified, encTag, "")
+			check("压缩请求+弱前缀压缩标签", with(encHdr, "W/"+encTag), fasthttp.StatusNotModified, encTag, "")
+			check("identity请求+无关标签", with(nil, `"other"`), fasthttp.StatusOK, idTag, "")
+		})
+	}
+}
+
+// TestStaticIfNoneMatch_ReviewScenario 复现评审场景：请求 1 带 gzip 得到 "abc-gzip"，
+// 请求 2 不接受 gzip 却携带 If-None-Match: "abc-gzip"，必须得到 200、identity 正文与 ETag "abc"。
+func TestStaticIfNoneMatch_ReviewScenario(t *testing.T) {
+	for _, gz := range []bool{false, true} {
+		name := "动态gzip"
+		if gz {
+			name = "预压缩gz"
+		}
+		t.Run(name, func(t *testing.T) {
+			handler := newEncStatic(t, encStaticOpts{size: 300, gz: gz})
+			r1 := doChain(handler, "GET", map[string]string{"Accept-Encoding": "gzip"})
+			gzTag := string(r1.Response.Header.Peek("ETag"))
+			if string(r1.Response.Header.Peek("Content-Encoding")) != "gzip" || gzTag == "" {
+				t.Fatalf("第一次请求应为 gzip 且带 ETag, got CE=%q ETag=%q", r1.Response.Header.Peek("Content-Encoding"), gzTag)
+			}
+			r2 := doChain(handler, "GET", map[string]string{"If-None-Match": gzTag})
+			if r2.Response.StatusCode() != fasthttp.StatusOK {
+				t.Fatalf("status = %d, want 200", r2.Response.StatusCode())
+			}
+			if len(r2.Response.Body()) != 300 || len(r2.Response.Header.Peek("Content-Encoding")) != 0 {
+				t.Errorf("应返回 identity 正文, len=%d CE=%q", len(r2.Response.Body()), r2.Response.Header.Peek("Content-Encoding"))
+			}
+			if got, want := string(r2.Response.Header.Peek("ETag")), strings.TrimSuffix(gzTag, `-gzip"`)+`"`; got != want {
+				t.Errorf("ETag = %q, want identity %q", got, want)
+			}
+		})
+	}
+}
+
+// TestStaticIfNoneMatch_UncompressedRepresentation 响应不会被压缩时（未协商、体积小于 min_size、
+// 非可压缩 MIME、无压缩中间件、Range 生效），表示就是 identity，压缩标签不匹配而 identity 标签匹配。
+func TestStaticIfNoneMatch_UncompressedRepresentation(t *testing.T) {
+	cases := []struct {
+		name string
+		opts encStaticOpts
+		hdr  map[string]string
+	}{
+		{"小于min_size", encStaticOpts{size: 300, minSize: 1000}, map[string]string{"Accept-Encoding": "gzip"}},
+		{"非可压缩MIME", encStaticOpts{size: 300, types: []string{"text/html"}}, map[string]string{"Accept-Encoding": "gzip"}},
+		{"无压缩中间件", encStaticOpts{size: 300, noCompress: true}, map[string]string{"Accept-Encoding": "gzip"}},
+		{"HEAD之外的Range生效", encStaticOpts{size: 300}, map[string]string{"Accept-Encoding": "gzip", "Range": "bytes=0-4"}},
+		{"预压缩存在但Range生效", encStaticOpts{size: 300, gz: true}, map[string]string{"Accept-Encoding": "gzip", "Range": "bytes=0-4"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			handler := newEncStatic(t, tc.opts)
+			plain := doChain(handler, "GET", tc.hdr)
+			idTag := string(plain.Response.Header.Peek("ETag"))
+			if idTag == "" || strings.Contains(idTag, "-gzip") {
+				t.Fatalf("ETag = %q, want identity", idTag)
+			}
+			gzTag := idTag[:len(idTag)-1] + `-gzip"`
+
+			hdr := maps.Clone(tc.hdr)
+			hdr["If-None-Match"] = gzTag
+			ctx := doChain(handler, "GET", hdr)
+			if ctx.Response.StatusCode() == fasthttp.StatusNotModified {
+				t.Errorf("gzip 标签不应匹配 identity 表示, got 304")
+			}
+
+			hdr["If-None-Match"] = idTag
+			ctx = doChain(handler, "GET", hdr)
+			if ctx.Response.StatusCode() != fasthttp.StatusNotModified {
+				t.Errorf("identity 标签: status = %d, want 304", ctx.Response.StatusCode())
+			}
+			if got := string(ctx.Response.Header.Peek("ETag")); got != idTag {
+				t.Errorf("304 ETag = %q, want %q", got, idTag)
+			}
+		})
 	}
 }
 
