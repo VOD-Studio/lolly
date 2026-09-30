@@ -75,3 +75,69 @@ func TestGzipStaticSelectEncoding_MatchesServeFile(t *testing.T) {
 		}
 	}
 }
+
+func TestMiddlewareCanFallBack(t *testing.T) {
+	mw, err := New(&config.CompressionConfig{Type: "gzip", Level: 6, MinSize: 10, Types: []string{"text/plain"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !mw.CanFallBack(300) || !mw.CanFallBack(streamingThreshold) {
+		t.Errorf("缓冲路径（<= streamingThreshold）压缩可能被放弃")
+	}
+	if mw.CanFallBack(streamingThreshold + 1) {
+		t.Errorf("流式路径（> streamingThreshold）不会回退")
+	}
+}
+
+// TestMiddlewareDeferredRevalidation 下游推迟 If-None-Match 判定后，
+// 压缩被放弃 -> 改写为 304；压缩发生 -> 保持 200；ETag 不一致 / 非 200 -> 不改写。
+func TestMiddlewareDeferredRevalidation(t *testing.T) {
+	mw, err := New(&config.CompressionConfig{Type: "gzip", Level: 6, MinSize: 10, Types: []string{"text/plain"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	random := make([]byte, 300)
+	x := uint64(88172645463325252)
+	for i := range random {
+		x ^= x << 13
+		x ^= x >> 7
+		x ^= x << 17
+		random[i] = byte(x >> 24)
+	}
+	text := make([]byte, 300)
+	for i := range text {
+		text[i] = 'a'
+	}
+	const tag = `"abc"`
+	run := func(body []byte, deferTag, respTag string, status int) *fasthttp.RequestCtx {
+		ctx := &fasthttp.RequestCtx{}
+		ctx.Request.Header.Set("Accept-Encoding", "gzip")
+		mw.Process(func(c *fasthttp.RequestCtx) {
+			DeferRevalidation(c, deferTag)
+			c.Response.SetStatusCode(status)
+			c.Response.Header.SetContentType("text/plain")
+			c.Response.Header.Set("ETag", respTag)
+			c.Response.Header.Set("Last-Modified", "Wed, 30 Sep 2026 00:00:00 GMT")
+			c.Response.SetBody(body)
+		})(ctx)
+		return ctx
+	}
+
+	ctx := run(random, tag, tag, 200)
+	if ctx.Response.StatusCode() != 304 || len(ctx.Response.Body()) != 0 ||
+		string(ctx.Response.Header.Peek("ETag")) != tag || len(ctx.Response.Header.Peek("Content-Encoding")) != 0 ||
+		len(ctx.Response.Header.Peek("Last-Modified")) == 0 {
+		t.Errorf("压缩放弃时应改写为 304 并保留 ETag/Last-Modified: %q", ctx.Response.Header.String())
+	}
+	ctx = run(text, tag, tag, 200)
+	if ctx.Response.StatusCode() != 200 || string(ctx.Response.Header.Peek("Content-Encoding")) != "gzip" ||
+		string(ctx.Response.Header.Peek("ETag")) != `"abc-gzip"` {
+		t.Errorf("压缩发生时应保持 200 gzip: %d %q", ctx.Response.StatusCode(), ctx.Response.Header.String())
+	}
+	if ctx = run(random, `"other"`, tag, 200); ctx.Response.StatusCode() != 200 {
+		t.Errorf("ETag 不一致不应改写")
+	}
+	if ctx = run(random, tag, tag, 404); ctx.Response.StatusCode() != 404 {
+		t.Errorf("非 200 不应改写")
+	}
+}

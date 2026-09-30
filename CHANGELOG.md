@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - 多区间、非 bytes 单位、语法非法的 Range 被忽略（返回完整 200）；仅对 GET 生效，HEAD 等其他方法忽略 Range（RFC 9110 14.2），返回 200 与完整元数据
   - 内存读取、文件缓存、sendfile 路径均支持；sendfile 区间仍走零拷贝
   - 存在 Range 时不使用预压缩文件，压缩中间件不压缩 206 响应；被压缩的 200 响应会移除 `Accept-Ranges`
-  - 不同内容编码的表示使用不同的强 ETag：压缩响应（动态 gzip/br 与预压缩 `.gz`/`.br`）ETag 追加编码后缀，如 `"abc-gzip"`；`If-Range` 仅与未压缩表示的 ETag 比较，携带压缩变体 ETag 时回退完整 200，避免拼接出损坏文件；`If-None-Match` 命中 identity 或压缩变体 ETag 均返回 304
+  - 不同内容编码的表示使用不同的强 ETag：压缩响应（动态 gzip/br 与预压缩 `.gz`/`.br`）ETag 追加编码后缀，如 `"abc-gzip"`；`If-Range` 仅与未压缩表示的 ETag 比较，携带压缩变体 ETag 时回退完整 200，避免拼接出损坏文件；`If-None-Match` 只与本次响应实际选用表示的 ETag 比较（identity 标签不匹配压缩表示，反之亦然），命中返回 304
 
 #### Proxy
 
@@ -39,6 +39,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - HTTP/1.1 与 prior-knowledge h2c 在协议嗅探前共用 `max_conns_per_ip` 额度，h2c 连接总数同时受 `concurrency` 约束
   - `Upgrade: h2c` 支持流式入站请求体；握手前临时物化流 1 请求体，升级后的 HTTP/2 请求仍按配置流式处理
   - `h2c_enabled` 与 `enabled`/TLS 监听器搭配无效时启动告警
+
+### Fixed
+
+- **handler/compression**: 修复压缩后体积未变小、压缩中间件放弃压缩回退 identity 时，`If-None-Match` 再验证永远得不到 304 的问题
+  - 原因：静态处理器先于压缩中间件运行，按预测的压缩表示（如 `"abc-gzip"`）比较 `If-None-Match`，而回退后的响应实际带 identity ETag `"abc"`，客户端拿该 ETag 再验证始终 200
+  - 修复：预测为可能回退的缓冲压缩（响应体 ≤ 64KB）时，若标签命中 identity ETag，处理器通过 `compression.DeferRevalidation` 把判定交给压缩中间件；中间件确定最终表示后，压缩被放弃则改写为 304（回显 identity ETag），压缩发生则保持 200，identity 标签仍不匹配压缩表示。流式压缩（> 64KB）不会回退，预测精确，无需推迟
 
 ## [0.5.0] - 2026-09-28
 

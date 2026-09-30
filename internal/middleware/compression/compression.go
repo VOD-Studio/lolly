@@ -285,6 +285,10 @@ func (m *Middleware) Process(next fasthttp.RequestHandler) fasthttp.RequestHandl
 				setEncodedETag(ctx, encoding)
 				ctx.Response.Header.Del("Content-Length")
 				ctx.Response.Header.Del("Accept-Ranges")
+			} else {
+				// 压缩后体积没有变小，放弃压缩，最终表示是 identity。
+				// 下游若因此推迟了 If-None-Match 的判定，在这里按最终表示补上。
+				completeDeferredRevalidation(ctx)
 			}
 		}
 	}
@@ -295,6 +299,49 @@ func (m *Middleware) Process(next fasthttp.RequestHandler) fasthttp.RequestHandl
 // 中间件在调用下游处理器之前写入 *Middleware，处理器可通过 PredictEncoding
 // 得知本次响应是否会被压缩，从而在压缩发生之前就用正确表示的 ETag 评估条件请求。
 const ContextKey = "lolly.compression"
+
+// RevalidateKey 是下游处理器在 RequestCtx.UserValue 中登记“推迟条件请求判定”的键，值为 identity ETag（string）。
+//
+// 背景：处理器先于本中间件运行，只能预测“会尝试压缩”，无法预知压缩后体积是否反而变大而被放弃。
+// 当客户端携带的 If-None-Match 命中 identity ETag、而预测的压缩表示 ETag 不匹配，
+// 且压缩可能被放弃（见 CanFallBack）时，处理器不直接判定，而是调用 DeferRevalidation
+// 正常产生 200 响应，由本中间件在确定最终表示后决定：
+//   - 压缩确实发生：响应为压缩表示（ETag 为变体），保持 200，identity 标签不应匹配压缩表示；
+//   - 压缩被放弃：最终表示是 identity，标签命中，本中间件把响应改写为 304。
+const RevalidateKey = "lolly.compression.revalidate"
+
+// DeferRevalidation 让下游处理器把 If-None-Match 命中 identity ETag 的判定推迟给压缩中间件。
+// etag 是 identity 表示的 ETag，中间件只在最终响应仍为 200、无 Content-Encoding 且 ETag 相同时改写为 304。
+func DeferRevalidation(ctx *fasthttp.RequestCtx, etag string) {
+	ctx.SetUserValue(RevalidateKey, etag)
+}
+
+// completeDeferredRevalidation 在压缩被放弃（最终为 identity 表示）时兑现被推迟的条件请求：
+// 把 200 响应改写为 304（保留 ETag、Last-Modified、缓存头，丢弃正文）。
+func completeDeferredRevalidation(ctx *fasthttp.RequestCtx) {
+	etag, ok := ctx.UserValue(RevalidateKey).(string)
+	if !ok || etag == "" {
+		return
+	}
+	if ctx.Response.StatusCode() != fasthttp.StatusOK ||
+		len(ctx.Response.Header.Peek("Content-Encoding")) > 0 ||
+		string(ctx.Response.Header.Peek("ETag")) != etag {
+		return
+	}
+	ctx.Response.SetStatusCode(fasthttp.StatusNotModified)
+	ctx.Response.ResetBody()
+	ctx.Response.SkipBody = true
+	ctx.Response.Header.Del("Content-Length")
+	ctx.Response.Header.Del("Content-Type")
+}
+
+// CanFallBack 报告对长度为 bodyLen 的响应体，Process 尝试压缩后是否可能放弃压缩回退 identity。
+//
+// 仅缓冲压缩路径（bodyLen <= streamingThreshold）会比较压缩前后体积并可能放弃；
+// 流式压缩路径（bodyLen > streamingThreshold）一旦决定压缩就不回退，预测是精确的。
+func (m *Middleware) CanFallBack(bodyLen int) bool {
+	return bodyLen <= streamingThreshold
+}
 
 // negotiate 根据配置的算法与客户端 Accept-Encoding 选择编码，
 // 返回 "gzip"、"br"，客户端不支持时返回空字符串。
@@ -325,9 +372,9 @@ func (m *Middleware) shouldCompress(contentType []byte, bodyLen int) bool {
 // 会选择的内容编码，返回 "gzip"、"br"，预计不压缩时返回空字符串。
 //
 // 它与 Process 使用同一套决策（Accept-Encoding 协商、最小长度、MIME 类型），
-// 但无法预知压缩后体积是否反而变大（此时 Process 会放弃压缩），
-// 因此预测的是“尝试压缩”的编码。调用方需自行排除已带 Content-Encoding、
-// 或会产生 206/416（Range）的响应。
+// 但无法预知压缩后体积是否反而变大（此时 Process 会放弃压缩，仅缓冲路径，见 CanFallBack），
+// 因此预测的是“尝试压缩”的编码；需要精确结果的条件请求应配合 DeferRevalidation。
+// 调用方需自行排除已带 Content-Encoding、或会产生 206/416（Range）的响应。
 func (m *Middleware) PredictEncoding(acceptEncoding, contentType []byte, bodyLen int) string {
 	encoding := m.negotiate(acceptEncoding)
 	if encoding == "" || !m.shouldCompress(contentType, bodyLen) {

@@ -441,7 +441,7 @@ func (h *StaticHandler) tryServeFromFileCache(ctx *fasthttp.RequestCtx, filePath
 	// 缓存命中路径不会发送预压缩文件，响应内容始终是 identity 字节，
 	// 仅可能被后续压缩中间件动态压缩；Range 生效时则不会被压缩。
 	spec := evalRange(ctx, int64(len(entry.Data)), entry.ETag, info.ModTime())
-	respTag := h.representationETag(ctx, entry.ETag, filePath, entry.ContentType, int64(len(entry.Data)), spec, false)
+	respTag, mayFallBack := h.representationETag(ctx, entry.ETag, filePath, entry.ContentType, int64(len(entry.Data)), spec, false)
 
 	// respond 写入缓存内容，按 Range 请求截取（206/416）。
 	respond := func() {
@@ -456,7 +456,7 @@ func (h *StaticHandler) tryServeFromFileCache(ctx *fasthttp.RequestCtx, filePath
 
 	// TTL 验证（cacheTTL > 0 时启用）
 	if h.cacheTTL > 0 && time.Since(entry.CachedAt) < h.cacheTTL {
-		if isNotModified(ctx, respTag, info.ModTime()) {
+		if notModifiedForRepresentation(ctx, entry.ETag, respTag, mayFallBack, info.ModTime()) {
 			ctx.Response.SetStatusCode(fasthttp.StatusNotModified)
 			ctx.Response.Header.Set("ETag", respTag)
 			ctx.Response.Header.Set("Last-Modified", info.ModTime().UTC().Format(httpTimeFormat))
@@ -470,7 +470,7 @@ func (h *StaticHandler) tryServeFromFileCache(ctx *fasthttp.RequestCtx, filePath
 
 	// TTL 过期或未启用 TTL，验证文件新鲜度
 	if entry.ModTime.Equal(info.ModTime()) {
-		if isNotModified(ctx, respTag, info.ModTime()) {
+		if notModifiedForRepresentation(ctx, entry.ETag, respTag, mayFallBack, info.ModTime()) {
 			ctx.Response.SetStatusCode(fasthttp.StatusNotModified)
 			ctx.Response.Header.Set("ETag", respTag)
 			ctx.Response.Header.Set("Last-Modified", info.ModTime().UTC().Format(httpTimeFormat))
@@ -723,8 +723,8 @@ func (h *StaticHandler) serveFile(ctx *fasthttp.RequestCtx, filePath string, inf
 	// 确定本次响应实际选用的表示（identity / gzip / br），条件请求只与该表示的 ETag 比较。
 	// 例如响应将被 gzip 时，客户端持有的 identity ETag 不匹配，须返回 200 而非 304（RFC 9110 13.1.2）。
 	contentType := mimeutil.DetectContentType(filePath)
-	respTag := h.representationETag(ctx, etag, filePath, contentType, info.Size(), spec, true)
-	if isNotModified(ctx, respTag, info.ModTime()) {
+	respTag, mayFallBack := h.representationETag(ctx, etag, filePath, contentType, info.Size(), spec, true)
+	if notModifiedForRepresentation(ctx, etag, respTag, mayFallBack, info.ModTime()) {
 		ctx.Response.SetStatusCode(fasthttp.StatusNotModified)
 		ctx.Response.Header.Set("ETag", respTag)
 		ctx.Response.Header.Set("Last-Modified", info.ModTime().UTC().Format(httpTimeFormat))
@@ -967,7 +967,7 @@ func (h *StaticHandler) validateSymlink(filePath string) error {
 	return nil
 }
 
-// representationETag 返回本次响应实际选用的表示的 ETag，条件请求（If-None-Match）只与它比较。
+// representationETag 返回本次响应预测选用的表示的 ETag，条件请求（If-None-Match）主要与它比较。
 //
 // 静态处理器先于压缩中间件运行，所以需要在发送前预测最终的内容编码，规则与实际发送一致：
 //  1. Range 生效（206/416）：始终是 identity 字节，既不用预压缩文件，压缩中间件也不压缩 206；
@@ -976,22 +976,48 @@ func (h *StaticHandler) validateSymlink(filePath string) error {
 //  4. 其余为 identity。
 //
 // 编码变体 ETag 由 utils.ETagForEncoding 生成，与压缩中间件改写后的 ETag 一致。
+//
+// 第二个返回值 mayFallBack 为 true 表示预测的是动态压缩且该压缩可能被中间件放弃
+// （缓冲路径下压缩后体积没有变小，此时最终表示是 identity，ETag 为 identity 标签）。
+// 处理器无法预知这一点，条件请求需经 notModifiedForRepresentation 交由中间件兜底。
 func (h *StaticHandler) representationETag(ctx *fasthttp.RequestCtx, etag, filePath, contentType string,
 	size int64, spec rangeSpec, allowPrecompressed bool,
-) string {
+) (tag string, mayFallBack bool) {
 	if spec.state != rangeNone {
-		return etag
+		return etag, false
 	}
 	if allowPrecompressed && h.gzipStatic != nil {
 		if enc := h.gzipStatic.SelectEncoding(ctx, strings.TrimPrefix(filePath, h.root)); enc != "" {
-			return utils.ETagForEncoding(etag, enc)
+			return utils.ETagForEncoding(etag, enc), false
 		}
 	}
 	if mw, ok := ctx.UserValue(compression.ContextKey).(*compression.Middleware); ok && mw != nil {
 		enc := mw.PredictEncoding(ctx.Request.Header.Peek("Accept-Encoding"), []byte(contentType), int(size))
-		return utils.ETagForEncoding(etag, enc)
+		if enc != "" {
+			return utils.ETagForEncoding(etag, enc), mw.CanFallBack(int(size))
+		}
 	}
-	return etag
+	return etag, false
+}
+
+// notModifiedForRepresentation 评估条件请求，返回 true 表示处理器应直接返回 304。
+//
+// respTag 是预测表示的 ETag（见 representationETag）。预测表示为动态压缩且可能被放弃（mayFallBack）时，
+// 若 If-None-Match 未命中 respTag 却命中 identity 标签 idTag，处理器无法确定最终表示：
+//   - 压缩发生：最终表示是压缩变体，identity 标签不应匹配，须 200；
+//   - 压缩被放弃：最终表示是 identity，应 304。
+//
+// 此时返回 false 让响应照常生成，并通过 compression.DeferRevalidation 交由压缩中间件在决定最终表示后改写为 304。
+// 其余情形（预压缩、Range、无压缩中间件、流式压缩路径）预测是精确的，不涉及推迟。
+func notModifiedForRepresentation(ctx *fasthttp.RequestCtx, idTag, respTag string, mayFallBack bool, modTime time.Time) bool {
+	if isNotModified(ctx, respTag, modTime) {
+		return true
+	}
+	if mayFallBack && respTag != idTag && ctx.Request.Header.Peek("If-None-Match") != nil &&
+		isNotModified(ctx, idTag, modTime) {
+		compression.DeferRevalidation(ctx, idTag)
+	}
+	return false
 }
 
 // weakETagMatch 按弱比较（RFC 9110 8.8.3.2）判断两个 entity-tag 是否相同：仅忽略 W/ 前缀。
