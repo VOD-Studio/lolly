@@ -574,3 +574,37 @@ func TestCompressorPoolConcurrentGet(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// TestProcessEncodedETag 压缩后的强 ETag 追加编码后缀；未压缩与弱 ETag 保持不变。
+func TestProcessEncodedETag(t *testing.T) {
+	body := bytes.Repeat([]byte("etag body "), 100)
+	for _, tc := range []struct {
+		name, alg, ae, in, want string
+	}{
+		{"gzip强", "gzip", "gzip", `"abc"`, `"abc-gzip"`},
+		{"br强", "brotli", "br", `"abc"`, `"abc-br"`},
+		{"弱ETag不变", "gzip", "gzip", `W/"abc"`, `W/"abc"`},
+		{"未压缩不变", "gzip", "", `"abc"`, `"abc"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mw, err := New(&config.CompressionConfig{Type: tc.alg, Level: 4, MinSize: 10, Types: []string{"text/plain"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			h := mw.Process(func(ctx *fasthttp.RequestCtx) {
+				ctx.Response.Header.SetContentType("text/plain")
+				ctx.Response.Header.Set("ETag", tc.in)
+				ctx.Response.SetBody(body)
+			})
+			ctx := &fasthttp.RequestCtx{}
+			ctx.Request.SetRequestURI("/")
+			if tc.ae != "" {
+				ctx.Request.Header.Set("Accept-Encoding", tc.ae)
+			}
+			h(ctx)
+			if got := string(ctx.Response.Header.Peek("ETag")); got != tc.want {
+				t.Errorf("ETag = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

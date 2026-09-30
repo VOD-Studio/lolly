@@ -84,3 +84,21 @@ func TestGenerateETag_DifferentInputs(t *testing.T) {
 	assert.NotEqual(t, GenerateETag(t1, 100), GenerateETag(t1, 200),
 		"different sizes should produce different ETags")
 }
+
+func TestETagForEncoding(t *testing.T) {
+	tests := []struct{ etag, enc, want string }{
+		{`"abc"`, "gzip", `"abc-gzip"`},
+		{`"abc"`, "br", `"abc-br"`},
+		{`"abc"`, "GZIP", `"abc-gzip"`},
+		{`"abc"`, "", `"abc"`},
+		{`"abc"`, "identity", `"abc"`},
+		{`W/"abc"`, "gzip", `W/"abc"`},
+		{``, "gzip", ``},
+		{`"abc-gzip"`, "gzip", `"abc-gzip"`},
+	}
+	for _, tt := range tests {
+		if got := ETagForEncoding(tt.etag, tt.enc); got != tt.want {
+			t.Errorf("ETagForEncoding(%q,%q) = %q, want %q", tt.etag, tt.enc, got, tt.want)
+		}
+	}
+}

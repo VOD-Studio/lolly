@@ -9,7 +9,7 @@
 // 设计取舍：
 //   - 仅支持单区间；多区间（含逗号）、非 bytes 单位、语法非法的 Range 一律忽略，
 //     按普通 200 返回完整内容（RFC 9110 14.2 允许服务端忽略 Range）。
-//   - 仅对 GET/HEAD 生效。
+//   - 仅对 GET 生效；HEAD 等其他方法忽略 Range（RFC 9110 14.2）。
 //   - Range 始终作用于未压缩（identity）内容：存在有效 Range 时跳过预压缩文件，
 //     且压缩中间件不会压缩 206 响应。
 //
@@ -63,7 +63,7 @@ func (s rangeSpec) slice(data []byte) []byte {
 // 参数：
 //   - ctx: fasthttp 请求上下文
 //   - size: 资源（未压缩）完整长度
-//   - etag: 资源当前 ETag（用于 If-Range）
+//   - etag: 资源 identity（未压缩）表示的强 ETag（用于 If-Range）
 //   - modTime: 资源修改时间（用于 If-Range 日期比较）
 func evalRange(ctx *fasthttp.RequestCtx, size int64, etag string, modTime time.Time) rangeSpec {
 	spec := rangeSpec{state: rangeNone, size: size}
@@ -78,9 +78,12 @@ func evalRange(ctx *fasthttp.RequestCtx, size int64, etag string, modTime time.T
 	return spec
 }
 
-// hasRangeRequest 判断请求是否携带 Range 头且方法为 GET/HEAD。
+// hasRangeRequest 判断请求是否携带 Range 头且方法为 GET。
+//
+// RFC 9110 14.2：Range 仅对 GET 定义，其他方法（含 HEAD）必须忽略它，
+// HEAD 应返回与 GET 完整响应一致的元数据（200、完整 Content-Length）。
 func hasRangeRequest(ctx *fasthttp.RequestCtx) bool {
-	if !ctx.IsGet() && !ctx.IsHead() {
+	if !ctx.IsGet() {
 		return false
 	}
 	return len(ctx.Request.Header.Peek("Range")) > 0
@@ -88,7 +91,8 @@ func hasRangeRequest(ctx *fasthttp.RequestCtx) bool {
 
 // ifRangeMatches 检查 If-Range 条件，无 If-Range 时视为匹配。
 //
-// If-Range 为 ETag 时要求与当前强 ETag 完全一致（弱 ETag 不匹配）；
+// If-Range 为 ETag 时要求与当前 identity（未压缩）表示的强 ETag 完全一致
+// （弱 ETag 不匹配；压缩表示的 ETag 带编码后缀，因此同样不匹配，回退完整响应）；
 // 为 HTTP 日期时要求与 Last-Modified 精确相等（秒级）。
 func ifRangeMatches(ctx *fasthttp.RequestCtx, etag string, modTime time.Time) bool {
 	v := strings.TrimSpace(string(ctx.Request.Header.Peek("If-Range")))

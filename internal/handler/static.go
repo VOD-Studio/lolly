@@ -454,7 +454,7 @@ func (h *StaticHandler) tryServeFromFileCache(ctx *fasthttp.RequestCtx, filePath
 	if h.cacheTTL > 0 && time.Since(entry.CachedAt) < h.cacheTTL {
 		if isNotModified(ctx, entry.ETag, info.ModTime()) {
 			ctx.Response.SetStatusCode(fasthttp.StatusNotModified)
-			ctx.Response.Header.Set("ETag", entry.ETag)
+			ctx.Response.Header.Set("ETag", matchedETag(ctx, entry.ETag))
 			ctx.Response.Header.Set("Last-Modified", info.ModTime().UTC().Format(httpTimeFormat))
 			ctx.Response.Header.Set("Accept-Ranges", "bytes")
 			ctx.Response.SkipBody = true
@@ -468,7 +468,7 @@ func (h *StaticHandler) tryServeFromFileCache(ctx *fasthttp.RequestCtx, filePath
 	if entry.ModTime.Equal(info.ModTime()) {
 		if isNotModified(ctx, entry.ETag, info.ModTime()) {
 			ctx.Response.SetStatusCode(fasthttp.StatusNotModified)
-			ctx.Response.Header.Set("ETag", entry.ETag)
+			ctx.Response.Header.Set("ETag", matchedETag(ctx, entry.ETag))
 			ctx.Response.Header.Set("Last-Modified", info.ModTime().UTC().Format(httpTimeFormat))
 			ctx.Response.Header.Set("Accept-Ranges", "bytes")
 			ctx.Response.SkipBody = true
@@ -713,7 +713,7 @@ func (h *StaticHandler) serveFile(ctx *fasthttp.RequestCtx, filePath string, inf
 	etag := utils.GenerateETag(info.ModTime(), info.Size())
 	if isNotModified(ctx, etag, info.ModTime()) {
 		ctx.Response.SetStatusCode(fasthttp.StatusNotModified)
-		ctx.Response.Header.Set("ETag", etag)
+		ctx.Response.Header.Set("ETag", matchedETag(ctx, etag))
 		ctx.Response.Header.Set("Last-Modified", info.ModTime().UTC().Format(httpTimeFormat))
 		ctx.Response.Header.Set("Accept-Ranges", "bytes")
 		h.setCacheHeaders(ctx)
@@ -722,8 +722,8 @@ func (h *StaticHandler) serveFile(ctx *fasthttp.RequestCtx, filePath string, inf
 	}
 
 	// 评估 Range 请求（条件请求之后、内容选择之前）。
-	// Range 始终作用于未压缩内容，因此区间不可满足时直接 416，
-	// 有 Range 请求时也不使用预压缩文件（见下）。
+	// Range 始终作用于未压缩（identity）内容，且 If-Range 只与 identity 强 ETag 比较，
+	// 因此区间不可满足时直接 416，Range 生效时也不使用预压缩文件（见下）。
 	spec := evalRange(ctx, info.Size(), etag, info.ModTime())
 	if spec.state == rangeUnsatisfiable {
 		ctx.Response.Header.Set("ETag", etag)
@@ -733,13 +733,18 @@ func (h *StaticHandler) serveFile(ctx *fasthttp.RequestCtx, filePath string, inf
 	}
 
 	// 尝试发送预压缩文件。
-	// 存在 Range 请求时跳过：预压缩文件是另一种编码表示，其字节偏移与原文件不同，
+	// Range 生效（206/416）时跳过：预压缩文件是另一种编码表示，其字节偏移与原文件不同，
 	// 直接对其应用 Range 会得到与 ETag/Content-Length 不一致的数据。
-	if h.gzipStatic != nil && !hasRangeRequest(ctx) {
+	// Range 被忽略（HEAD、If-Range 不匹配、非法/多区间）时正常发送预压缩文件。
+	if h.gzipStatic != nil && spec.state == rangeNone {
 		relPath := strings.TrimPrefix(filePath, h.root)
+		// Range 已被忽略，但 fasthttp.ServeFile 会自行处理 Range（且不看 If-Range），
+		// 会对预压缩字节返回 206；此处移除 Range 头，保证返回完整的压缩表示。
+		ctx.Request.Header.Del("Range")
 		if h.gzipStatic.ServeFile(ctx, relPath) {
-			// 预压缩文件已发送，补充验证头
-			ctx.Response.Header.Set("ETag", etag)
+			// 预压缩文件已发送，补充验证头。
+			// 压缩表示与 identity 字节不同，使用带编码后缀的独立强 ETag。
+			ctx.Response.Header.Set("ETag", utils.ETagForEncoding(etag, string(ctx.Response.Header.Peek("Content-Encoding"))))
 			ctx.Response.Header.Set("Last-Modified", info.ModTime().UTC().Format(httpTimeFormat))
 			h.setCacheHeaders(ctx)
 			return
@@ -953,13 +958,46 @@ func (h *StaticHandler) validateSymlink(filePath string) error {
 	return nil
 }
 
+// encodingETagSuffixes 是各内容编码表示的 ETag 后缀（与 utils.ETagForEncoding 一致）。
+var encodingETagSuffixes = [...]string{"gzip", "br"}
+
+// matchedETag 返回 If-None-Match 中命中的 ETag（identity 或其编码变体）；
+// 没有命中时返回 etag 本身。用于 304 响应回显客户端持有的那个表示的 ETag。
+func matchedETag(ctx *fasthttp.RequestCtx, etag string) string {
+	match := ctx.Request.Header.Peek("If-None-Match")
+	if len(match) == 0 {
+		return etag
+	}
+	for tag := range strings.SplitSeq(string(match), ",") {
+		tag = strings.TrimSpace(tag)
+		if tag == etag {
+			return etag
+		}
+		for _, enc := range encodingETagSuffixes {
+			if tag == utils.ETagForEncoding(etag, enc) {
+				return tag
+			}
+		}
+	}
+	return etag
+}
+
 // isNotModified 检查条件请求是否匹配（返回 true 表示应返回 304）。
+//
+// If-None-Match 命中 identity 强 ETag 或其压缩变体（"<etag>-gzip"/"<etag>-br"）均视为命中：
+// 它们表示同一资源同一版本，只是内容编码不同，资源未变化时应返回 304。
 func isNotModified(ctx *fasthttp.RequestCtx, etag string, modTime time.Time) bool {
 	if match := ctx.Request.Header.Peek("If-None-Match"); len(match) > 0 {
 		// RFC 9110: If-None-Match = #entity-tag，逗号分隔
 		for tag := range strings.SplitSeq(string(match), ",") {
-			if strings.TrimSpace(tag) == etag {
+			tag = strings.TrimSpace(tag)
+			if tag == etag {
 				return true
+			}
+			for _, enc := range encodingETagSuffixes {
+				if tag == utils.ETagForEncoding(etag, enc) {
+					return true
+				}
 			}
 		}
 	}

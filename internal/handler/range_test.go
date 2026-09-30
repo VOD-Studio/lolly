@@ -10,6 +10,7 @@
 package handler
 
 import (
+	"bufio"
 	"bytes"
 	"io"
 	"net"
@@ -257,18 +258,45 @@ func TestStaticRange_IfRange(t *testing.T) {
 	}
 }
 
-func TestStaticRange_Head(t *testing.T) {
+// TestStaticRange_HeadIgnoresRange HEAD 必须忽略 Range（RFC 9110 14.2：Range 仅对 GET 定义），
+// 返回 200 与完整资源的元数据，而不是 206。
+func TestStaticRange_HeadIgnoresRange(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "f.txt"), rangeFixture(200), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	h := NewStaticHandler(root, "/", nil, false)
 	ctx := rangeGet(t, h, "HEAD", "/f.txt", map[string]string{"Range": "bytes=0-4"})
-	if ctx.Response.StatusCode() != fasthttp.StatusPartialContent {
-		t.Fatalf("status = %d, want 206", ctx.Response.StatusCode())
+	if ctx.Response.StatusCode() != fasthttp.StatusOK {
+		t.Fatalf("status = %d, want 200", ctx.Response.StatusCode())
 	}
-	if got := string(ctx.Response.Header.Peek("Content-Range")); got != "bytes 0-4/200" {
-		t.Errorf("Content-Range = %q", got)
+	if cr := ctx.Response.Header.Peek("Content-Range"); len(cr) != 0 {
+		t.Errorf("Content-Range = %q, want empty", cr)
+	}
+	if got := string(ctx.Response.Header.Peek("Accept-Ranges")); got != "bytes" {
+		t.Errorf("Accept-Ranges = %q, want bytes", got)
+	}
+	if got := headContentLength(t, ctx); got != 200 {
+		t.Errorf("Content-Length = %d, want 200", got)
+	}
+}
+
+// TestStaticRange_HeadOutOfRange HEAD 携带越界 Range 时同样忽略，返回 200 而不是 416。
+func TestStaticRange_HeadOutOfRange(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "f.txt"), rangeFixture(200), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h := NewStaticHandler(root, "/", nil, false)
+	ctx := rangeGet(t, h, "HEAD", "/f.txt", map[string]string{"Range": "bytes=9999-"})
+	if ctx.Response.StatusCode() != fasthttp.StatusOK {
+		t.Fatalf("status = %d, want 200 (not 416)", ctx.Response.StatusCode())
+	}
+	if cr := ctx.Response.Header.Peek("Content-Range"); len(cr) != 0 {
+		t.Errorf("Content-Range = %q, want empty", cr)
+	}
+	if got := headContentLength(t, ctx); got != 200 {
+		t.Errorf("Content-Length = %d, want 200", got)
 	}
 }
 
@@ -406,4 +434,148 @@ func TestStaticRange_RealConnSendfile(t *testing.T) {
 	if resp.StatusCode != 416 {
 		t.Errorf("unsatisfiable: status=%d, want 416", resp.StatusCode)
 	}
+}
+
+// newCompressedStatic 构造 压缩中间件 + 静态处理器 的请求处理链，并写入一个 n 字节文本文件。
+func newCompressedStatic(t *testing.T, n int, gzipStatic bool) (fasthttp.RequestHandler, []byte) {
+	t.Helper()
+	root := t.TempDir()
+	data := rangeFixture(n)
+	if err := os.WriteFile(filepath.Join(root, "f.txt"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h := NewStaticHandler(root, "/", nil, false)
+	if gzipStatic {
+		if err := os.WriteFile(filepath.Join(root, "f.txt.gz"), []byte("FAKE-GZIP-CONTENT"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		h.SetGzipStatic(true, []string{".txt"}, []string{".gz"})
+	}
+	mw, err := compression.New(&config.CompressionConfig{Type: "gzip", Level: 6, MinSize: 10, Types: []string{"text/plain"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return mw.Process(h.Handle), data
+}
+
+func doChain(handler fasthttp.RequestHandler, method string, hdr map[string]string) *fasthttp.RequestCtx {
+	ctx := testutil.NewRequestCtx(method, "/f.txt")
+	for k, v := range hdr {
+		ctx.Request.Header.Set(k, v)
+	}
+	handler(ctx)
+	return ctx
+}
+
+// TestStaticETag_DifferentPerEncoding 不同内容编码的表示携带不同的强 ETag。
+func TestStaticETag_DifferentPerEncoding(t *testing.T) {
+	for _, gzipStatic := range []bool{false, true} {
+		name := "动态gzip"
+		if gzipStatic {
+			name = "预压缩gz"
+		}
+		t.Run(name, func(t *testing.T) {
+			handler, _ := newCompressedStatic(t, 300, gzipStatic)
+			id := doChain(handler, "GET", nil)
+			gz := doChain(handler, "GET", map[string]string{"Accept-Encoding": "gzip"})
+			if string(gz.Response.Header.Peek("Content-Encoding")) != "gzip" {
+				t.Fatalf("Content-Encoding = %q, want gzip", gz.Response.Header.Peek("Content-Encoding"))
+			}
+			idTag := string(id.Response.Header.Peek("ETag"))
+			gzTag := string(gz.Response.Header.Peek("ETag"))
+			if idTag == "" || gzTag == "" {
+				t.Fatalf("missing ETag: identity=%q gzip=%q", idTag, gzTag)
+			}
+			if idTag == gzTag {
+				t.Fatalf("gzip and identity share ETag %q", idTag)
+			}
+			if gzTag[0] != '"' || gzTag[len(gzTag)-1] != '"' || gzTag != idTag[:len(idTag)-1]+`-gzip"` {
+				t.Errorf("gzip ETag = %q, want strong tag %q", gzTag, idTag[:len(idTag)-1]+`-gzip"`)
+			}
+		})
+	}
+}
+
+// TestStaticIfRange_CompressedETagFallsBackToFull 客户端用压缩响应的 ETag 做 If-Range 时，
+// 不能得到未压缩字节的 206，而必须回退完整 200（避免拼接出损坏的文件）。
+func TestStaticIfRange_CompressedETagFallsBackToFull(t *testing.T) {
+	for _, gzipStatic := range []bool{false, true} {
+		name := "动态gzip"
+		if gzipStatic {
+			name = "预压缩gz"
+		}
+		t.Run(name, func(t *testing.T) {
+			handler, data := newCompressedStatic(t, 300, gzipStatic)
+			gz := doChain(handler, "GET", map[string]string{"Accept-Encoding": "gzip"})
+			gzTag := string(gz.Response.Header.Peek("ETag"))
+
+			ctx := doChain(handler, "GET", map[string]string{"Range": "bytes=0-4", "If-Range": gzTag})
+			if ctx.Response.StatusCode() != fasthttp.StatusOK {
+				t.Fatalf("status = %d, want 200", ctx.Response.StatusCode())
+			}
+			if !bytes.Equal(ctx.Response.Body(), data) {
+				t.Errorf("body len = %d, want full %d bytes", len(ctx.Response.Body()), len(data))
+			}
+			if cr := ctx.Response.Header.Peek("Content-Range"); len(cr) != 0 {
+				t.Errorf("Content-Range = %q, want empty", cr)
+			}
+
+			// 带 Accept-Encoding 的续传请求同样回退到完整 200
+			ctx = doChain(handler, "GET", map[string]string{"Accept-Encoding": "gzip", "Range": "bytes=0-4", "If-Range": gzTag})
+			if ctx.Response.StatusCode() != fasthttp.StatusOK {
+				t.Errorf("with Accept-Encoding: status = %d, want 200", ctx.Response.StatusCode())
+			}
+		})
+	}
+}
+
+// TestStaticIfRange_IdentityETagPartial identity 表示的 ETag 通过 If-Range，返回 206。
+func TestStaticIfRange_IdentityETagPartial(t *testing.T) {
+	handler, data := newCompressedStatic(t, 300, true)
+	idTag := string(doChain(handler, "GET", nil).Response.Header.Peek("ETag"))
+	ctx := doChain(handler, "GET", map[string]string{"Accept-Encoding": "gzip", "Range": "bytes=0-4", "If-Range": idTag})
+	checkPartial(t, ctx, data[:5], "bytes 0-4/300")
+	if got := string(ctx.Response.Header.Peek("ETag")); got != idTag {
+		t.Errorf("206 ETag = %q, want identity %q", got, idTag)
+	}
+}
+
+// TestStaticIfNoneMatch_EncodingVariants If-None-Match 携带 identity 或压缩变体 ETag 均返回 304，
+// 且 304 回显客户端持有的那个 ETag。
+func TestStaticIfNoneMatch_EncodingVariants(t *testing.T) {
+	handler, _ := newCompressedStatic(t, 300, false)
+	idTag := string(doChain(handler, "GET", nil).Response.Header.Peek("ETag"))
+	gzTag := string(doChain(handler, "GET", map[string]string{"Accept-Encoding": "gzip"}).Response.Header.Peek("ETag"))
+	for _, tag := range []string{idTag, gzTag} {
+		ctx := doChain(handler, "GET", map[string]string{"Accept-Encoding": "gzip", "If-None-Match": tag})
+		if ctx.Response.StatusCode() != fasthttp.StatusNotModified {
+			t.Errorf("If-None-Match %q: status = %d, want 304", tag, ctx.Response.StatusCode())
+		}
+		if got := string(ctx.Response.Header.Peek("ETag")); got != tag {
+			t.Errorf("304 ETag = %q, want %q", got, tag)
+		}
+	}
+	ctx := doChain(handler, "GET", map[string]string{"If-None-Match": `"other"`})
+	if ctx.Response.StatusCode() != fasthttp.StatusOK {
+		t.Errorf("mismatched If-None-Match: status = %d, want 200", ctx.Response.StatusCode())
+	}
+}
+
+// headContentLength 将响应序列化后解析 Content-Length（HEAD 响应的长度在写出时才确定）。
+func headContentLength(t *testing.T, ctx *fasthttp.RequestCtx) int {
+	t.Helper()
+	var buf bytes.Buffer
+	bw := bufio.NewWriter(&buf)
+	if err := ctx.Response.Write(bw); err != nil {
+		t.Fatal(err)
+	}
+	if err := bw.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	var resp fasthttp.Response
+	resp.SkipBody = true
+	if err := resp.Read(bufio.NewReader(&buf)); err != nil {
+		t.Fatal(err)
+	}
+	return resp.Header.ContentLength()
 }

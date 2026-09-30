@@ -28,6 +28,7 @@ import (
 	"github.com/klauspost/compress/gzip"
 	"github.com/valyala/fasthttp"
 	"rua.plus/lolly/internal/config"
+	"rua.plus/lolly/internal/utils"
 )
 
 // resettableWriteCloser 接口用于统一 gzip.Writer 和 brotli.Writer 的操作。
@@ -303,10 +304,26 @@ func (m *Middleware) Process(next fasthttp.RequestHandler) fasthttp.RequestHandl
 			if len(compressed) > 0 && len(compressed) < bodyLen {
 				ctx.Response.SetBody(compressed)
 				ctx.Response.Header.Set("Content-Encoding", encoding)
+				setEncodedETag(ctx, encoding)
 				ctx.Response.Header.Del("Content-Length")
 				ctx.Response.Header.Del("Accept-Ranges")
 			}
 		}
+	}
+}
+
+// setEncodedETag 为压缩后的表示改写强 ETag，使其区别于未压缩表示。
+//
+// 压缩表示与 identity 表示字节不同，共用同一强 ETag 会让 If-Range 等验证
+// 误判（如 Range 作用于未压缩内容却用压缩响应的 ETag 通过验证）。
+// 无 ETag 或弱 ETag 时不改动。
+func setEncodedETag(ctx *fasthttp.RequestCtx, encoding string) {
+	etag := string(ctx.Response.Header.Peek("ETag"))
+	if etag == "" {
+		return
+	}
+	if enc := utils.ETagForEncoding(etag, encoding); enc != etag {
+		ctx.Response.Header.Set("ETag", enc)
 	}
 }
 
@@ -373,6 +390,7 @@ func (m *Middleware) compressWithPool(data []byte, pool *compressorPool) []byte 
 //   - pool: 压缩 writer 缓冲池
 func (m *Middleware) streamWithPool(ctx *fasthttp.RequestCtx, encoding string, pool *compressorPool) {
 	ctx.Response.Header.Set("Content-Encoding", encoding)
+	setEncodedETag(ctx, encoding)
 	ctx.Response.Header.Del("Content-Length") // 使用 chunked encoding
 
 	body := ctx.Response.Body()
