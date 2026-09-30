@@ -438,9 +438,13 @@ func (h *StaticHandler) tryServeFromFileCache(ctx *fasthttp.RequestCtx, filePath
 		return false
 	}
 
+	// 缓存命中路径不会发送预压缩文件，响应内容始终是 identity 字节，
+	// 仅可能被后续压缩中间件动态压缩；Range 生效时则不会被压缩。
+	spec := evalRange(ctx, int64(len(entry.Data)), entry.ETag, info.ModTime())
+	respTag := h.representationETag(ctx, entry.ETag, filePath, entry.ContentType, int64(len(entry.Data)), spec, false)
+
 	// respond 写入缓存内容，按 Range 请求截取（206/416）。
 	respond := func() {
-		spec := evalRange(ctx, int64(len(entry.Data)), entry.ETag, info.ModTime())
 		ctx.Response.Header.SetContentType(entry.ContentType)
 		ctx.Response.Header.Set("ETag", entry.ETag)
 		ctx.Response.Header.Set("Last-Modified", info.ModTime().UTC().Format(httpTimeFormat))
@@ -452,9 +456,9 @@ func (h *StaticHandler) tryServeFromFileCache(ctx *fasthttp.RequestCtx, filePath
 
 	// TTL 验证（cacheTTL > 0 时启用）
 	if h.cacheTTL > 0 && time.Since(entry.CachedAt) < h.cacheTTL {
-		if isNotModified(ctx, entry.ETag, info.ModTime()) {
+		if isNotModified(ctx, respTag, info.ModTime()) {
 			ctx.Response.SetStatusCode(fasthttp.StatusNotModified)
-			ctx.Response.Header.Set("ETag", matchedETag(ctx, entry.ETag))
+			ctx.Response.Header.Set("ETag", respTag)
 			ctx.Response.Header.Set("Last-Modified", info.ModTime().UTC().Format(httpTimeFormat))
 			ctx.Response.Header.Set("Accept-Ranges", "bytes")
 			ctx.Response.SkipBody = true
@@ -466,9 +470,9 @@ func (h *StaticHandler) tryServeFromFileCache(ctx *fasthttp.RequestCtx, filePath
 
 	// TTL 过期或未启用 TTL，验证文件新鲜度
 	if entry.ModTime.Equal(info.ModTime()) {
-		if isNotModified(ctx, entry.ETag, info.ModTime()) {
+		if isNotModified(ctx, respTag, info.ModTime()) {
 			ctx.Response.SetStatusCode(fasthttp.StatusNotModified)
-			ctx.Response.Header.Set("ETag", matchedETag(ctx, entry.ETag))
+			ctx.Response.Header.Set("ETag", respTag)
 			ctx.Response.Header.Set("Last-Modified", info.ModTime().UTC().Format(httpTimeFormat))
 			ctx.Response.Header.Set("Accept-Ranges", "bytes")
 			ctx.Response.SkipBody = true
@@ -709,11 +713,20 @@ func (h *StaticHandler) handleStandard(ctx *fasthttp.RequestCtx, reqPath string)
 //   - filePath: 文件绝对路径
 //   - info: 文件信息（用于判断文件大小和修改时间）
 func (h *StaticHandler) serveFile(ctx *fasthttp.RequestCtx, filePath string, info os.FileInfo, skipCacheLookup bool) {
-	// 生成 ETag 并检查条件请求（在预压缩检查之前）
 	etag := utils.GenerateETag(info.ModTime(), info.Size())
-	if isNotModified(ctx, etag, info.ModTime()) {
+
+	// 评估 Range 请求。Range 始终作用于未压缩（identity）内容，且 If-Range 只与 identity
+	// 强 ETag 比较；Range 生效时不使用预压缩文件（见下），压缩中间件也不会压缩 206。
+	// Range 的评估不依赖 If-None-Match，先算出它才能确定本次响应实际选用的表示。
+	spec := evalRange(ctx, info.Size(), etag, info.ModTime())
+
+	// 确定本次响应实际选用的表示（identity / gzip / br），条件请求只与该表示的 ETag 比较。
+	// 例如响应将被 gzip 时，客户端持有的 identity ETag 不匹配，须返回 200 而非 304（RFC 9110 13.1.2）。
+	contentType := mimeutil.DetectContentType(filePath)
+	respTag := h.representationETag(ctx, etag, filePath, contentType, info.Size(), spec, true)
+	if isNotModified(ctx, respTag, info.ModTime()) {
 		ctx.Response.SetStatusCode(fasthttp.StatusNotModified)
-		ctx.Response.Header.Set("ETag", matchedETag(ctx, etag))
+		ctx.Response.Header.Set("ETag", respTag)
 		ctx.Response.Header.Set("Last-Modified", info.ModTime().UTC().Format(httpTimeFormat))
 		ctx.Response.Header.Set("Accept-Ranges", "bytes")
 		h.setCacheHeaders(ctx)
@@ -721,10 +734,7 @@ func (h *StaticHandler) serveFile(ctx *fasthttp.RequestCtx, filePath string, inf
 		return
 	}
 
-	// 评估 Range 请求（条件请求之后、内容选择之前）。
-	// Range 始终作用于未压缩（identity）内容，且 If-Range 只与 identity 强 ETag 比较，
-	// 因此区间不可满足时直接 416，Range 生效时也不使用预压缩文件（见下）。
-	spec := evalRange(ctx, info.Size(), etag, info.ModTime())
+	// 区间不可满足时直接 416
 	if spec.state == rangeUnsatisfiable {
 		ctx.Response.Header.Set("ETag", etag)
 		ctx.Response.Header.Set("Last-Modified", info.ModTime().UTC().Format(httpTimeFormat))
@@ -814,7 +824,6 @@ func (h *StaticHandler) serveFile(ctx *fasthttp.RequestCtx, filePath string, inf
 	}
 
 	// 存入缓存（仅对小文件缓存，缓存的始终是完整内容）
-	contentType := mimeutil.DetectContentType(filePath)
 	if h.fileCache != nil && info.Size() < 1024*1024 { // < 1MB
 		_ = h.fileCache.Set(filePath, data, info.Size(), info.ModTime(), contentType)
 	}
@@ -958,48 +967,52 @@ func (h *StaticHandler) validateSymlink(filePath string) error {
 	return nil
 }
 
-// encodingETagSuffixes 是各内容编码表示的 ETag 后缀（与 utils.ETagForEncoding 一致）。
-var encodingETagSuffixes = [...]string{"gzip", "br"}
-
-// matchedETag 返回 If-None-Match 中命中的 ETag（identity 或其编码变体）；
-// 没有命中时返回 etag 本身。用于 304 响应回显客户端持有的那个表示的 ETag。
-func matchedETag(ctx *fasthttp.RequestCtx, etag string) string {
-	match := ctx.Request.Header.Peek("If-None-Match")
-	if len(match) == 0 {
+// representationETag 返回本次响应实际选用的表示的 ETag，条件请求（If-None-Match）只与它比较。
+//
+// 静态处理器先于压缩中间件运行，所以需要在发送前预测最终的内容编码，规则与实际发送一致：
+//  1. Range 生效（206/416）：始终是 identity 字节，既不用预压缩文件，压缩中间件也不压缩 206；
+//  2. 存在客户端可接受的预压缩文件（allowPrecompressed 时）：使用其编码（br > gzip）；
+//  3. 否则若链上有压缩中间件：按其协商结果、min_size、MIME 类型预测动态压缩的编码；
+//  4. 其余为 identity。
+//
+// 编码变体 ETag 由 utils.ETagForEncoding 生成，与压缩中间件改写后的 ETag 一致。
+func (h *StaticHandler) representationETag(ctx *fasthttp.RequestCtx, etag, filePath, contentType string,
+	size int64, spec rangeSpec, allowPrecompressed bool,
+) string {
+	if spec.state != rangeNone {
 		return etag
 	}
-	for tag := range strings.SplitSeq(string(match), ",") {
-		tag = strings.TrimSpace(tag)
-		if tag == etag {
-			return etag
+	if allowPrecompressed && h.gzipStatic != nil {
+		if enc := h.gzipStatic.SelectEncoding(ctx, strings.TrimPrefix(filePath, h.root)); enc != "" {
+			return utils.ETagForEncoding(etag, enc)
 		}
-		for _, enc := range encodingETagSuffixes {
-			if tag == utils.ETagForEncoding(etag, enc) {
-				return tag
-			}
-		}
+	}
+	if mw, ok := ctx.UserValue(compression.ContextKey).(*compression.Middleware); ok && mw != nil {
+		enc := mw.PredictEncoding(ctx.Request.Header.Peek("Accept-Encoding"), []byte(contentType), int(size))
+		return utils.ETagForEncoding(etag, enc)
 	}
 	return etag
 }
 
+// weakETagMatch 按弱比较（RFC 9110 8.8.3.2）判断两个 entity-tag 是否相同：仅忽略 W/ 前缀。
+func weakETagMatch(a, b string) bool {
+	return strings.TrimPrefix(a, "W/") == strings.TrimPrefix(b, "W/")
+}
+
 // isNotModified 检查条件请求是否匹配（返回 true 表示应返回 304）。
 //
-// If-None-Match 命中 identity 强 ETag 或其压缩变体（"<etag>-gzip"/"<etag>-br"）均视为命中：
-// 它们表示同一资源同一版本，只是内容编码不同，资源未变化时应返回 304。
+// etag 必须是本次响应实际选用的表示的 ETag（见 representationETag）。
+// If-None-Match 使用弱比较（RFC 9110 13.1.2），不同编码表示的 ETag 互不匹配；
+// 存在 If-None-Match 时忽略 If-Modified-Since（RFC 9110 13.1.3）。
 func isNotModified(ctx *fasthttp.RequestCtx, etag string, modTime time.Time) bool {
 	if match := ctx.Request.Header.Peek("If-None-Match"); len(match) > 0 {
 		// RFC 9110: If-None-Match = #entity-tag，逗号分隔
 		for tag := range strings.SplitSeq(string(match), ",") {
-			tag = strings.TrimSpace(tag)
-			if tag == etag {
+			if weakETagMatch(strings.TrimSpace(tag), etag) {
 				return true
 			}
-			for _, enc := range encodingETagSuffixes {
-				if tag == utils.ETagForEncoding(etag, enc) {
-					return true
-				}
-			}
 		}
+		return false
 	}
 	if since := ctx.Request.Header.Peek("If-Modified-Since"); len(since) > 0 {
 		if t, err := fasthttp.ParseHTTPDate(since); err == nil {

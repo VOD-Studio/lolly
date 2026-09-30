@@ -103,22 +103,61 @@ func NewGzipStatic(enabled bool, root string, extensions, precompressedExtension
 // 返回值：
 //   - bool: true 表示已发送预压缩文件，false 表示未发送
 func (g *GzipStatic) ServeFile(ctx *fasthttp.RequestCtx, filePath string) bool {
-	if !g.enabled {
+	ext, fullPath, ok := g.selectPrecompressed(ctx.Request.Header.Peek("Accept-Encoding"), filePath)
+	if !ok {
 		return false
+	}
+
+	// 设置 Content-Encoding 头
+	ctx.Response.Header.Set("Content-Encoding", precompressedEncoding(ext))
+	ctx.Response.Header.Set("Vary", "Accept-Encoding")
+	// 设置原始文件的 Content-Type
+	// filePath 是原始文件路径 (如 "test.js")，直接使用即可
+	ctx.Response.Header.SetContentType(mimeutil.DetectContentType(filePath))
+
+	fasthttp.ServeFile(ctx, fullPath)
+	return true
+}
+
+// SelectEncoding 返回 ServeFile 会为该请求选用的预压缩内容编码（"br" 或 "gzip"），
+// 不会发送预压缩文件时返回空字符串。与 ServeFile 共用同一选择逻辑，且不修改响应。
+//
+// 用于在发送前评估条件请求：预压缩表示的 ETag 与 identity 表示不同。
+func (g *GzipStatic) SelectEncoding(ctx *fasthttp.RequestCtx, filePath string) string {
+	ext, _, ok := g.selectPrecompressed(ctx.Request.Header.Peek("Accept-Encoding"), filePath)
+	if !ok {
+		return ""
+	}
+	return precompressedEncoding(ext)
+}
+
+// precompressedEncoding 将预压缩文件扩展名映射为 Content-Encoding 值。
+func precompressedEncoding(ext string) string {
+	switch ext {
+	case ".br":
+		return "br"
+	case ".gz":
+		return "gzip"
+	}
+	return ""
+}
+
+// selectPrecompressed 按优先级选择要发送的预压缩文件。
+// 返回所选扩展名、预压缩文件完整路径；不适用时 ok 为 false。
+func (g *GzipStatic) selectPrecompressed(acceptEncoding []byte, filePath string) (ext, fullPath string, ok bool) {
+	if !g.enabled {
+		return "", "", false
 	}
 
 	// 检查文件扩展名
 	if !g.matchExtension(filePath) {
-		return false
+		return "", "", false
 	}
 
 	// 安全检查：防止目录遍历
 	if strings.Contains(filePath, "..") {
-		return false
+		return "", "", false
 	}
-
-	// 获取 Accept-Encoding 头
-	acceptEncoding := ctx.Request.Header.Peek("Accept-Encoding")
 
 	// 按优先级检查预压缩文件
 	for _, ext := range g.precompressedExtensions {
@@ -150,24 +189,13 @@ func (g *GzipStatic) ServeFile(ctx *fasthttp.RequestCtx, filePath string) bool {
 		if !exists {
 			continue
 		}
-
-		// 设置 Content-Encoding 头
-		switch ext {
-		case ".br":
-			ctx.Response.Header.Set("Content-Encoding", "br")
-		case ".gz":
-			ctx.Response.Header.Set("Content-Encoding", "gzip")
+		if precompressedEncoding(ext) == "" {
+			continue
 		}
-		ctx.Response.Header.Set("Vary", "Accept-Encoding")
-		// 设置原始文件的 Content-Type
-		// filePath 是原始文件路径 (如 "test.js")，直接使用即可
-		ctx.Response.Header.SetContentType(mimeutil.DetectContentType(filePath))
-
-		fasthttp.ServeFile(ctx, fullPath)
-		return true
+		return ext, fullPath, true
 	}
 
-	return false
+	return "", "", false
 }
 
 // matchExtension 检查文件扩展名是否在支持的预压缩扩展名列表中。
