@@ -496,6 +496,8 @@ func (m *Middleware) streamWithPool(ctx *fasthttp.RequestCtx, encoding string, p
 	// SetBodyStreamWriter 内部会 ResetBody：未启用 keepBodyBuffer（如 reduce_memory_usage: true）时，
 	// 原 body 缓冲区被归还 fasthttp 的池，而流式 goroutine 稍后才读取它，会与其他请求复用该缓冲区产生数据竞争。
 	// 因此在重置前复制一份，由闭包独占。
+	// 取舍：每个流式响应多一次 body 拷贝（响应体 > 64KB 才会走到这里），换取并发下的内存安全；
+	// 未启用 reduce_memory_usage 时缓冲区不会被归还，拷贝是保守的额外开销。
 	body := bytes.Clone(ctx.Response.Body())
 	ctx.SetBodyStreamWriter(func(w *bufio.Writer) {
 		writer, ok := pool.Get()
