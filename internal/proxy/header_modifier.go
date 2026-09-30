@@ -18,16 +18,20 @@ import (
 // modifyRequestHeaders 在转发请求到后端之前修改请求头。
 //
 // 执行以下操作：
-//  1. 设置 Host header 为目标主机地址
-//  2. 提取并设置 X-Forwarded-For、X-Real-IP、X-Forwarded-Host、X-Forwarded-Proto
-//  3. 应用自定义请求头配置（支持变量展开）
-//  4. 移除配置的请求头
+//  1. 将上游请求协议固定为 HTTP/1.1，并清理 hop-by-hop 头部
+//     （HTTP/2、HTTP/3 入站请求的协议标识不能透传给 HTTP/1.x 上游）
+//  2. 设置 Host header 为目标主机地址
+//  3. 提取并设置 X-Forwarded-For、X-Real-IP、X-Forwarded-Host、X-Forwarded-Proto
+//  4. 应用自定义请求头配置（支持变量展开）
+//  5. 移除配置的请求头
 //
 // 参数：
 //   - ctx: FastHTTP 请求上下文
 //   - target: 选中的后端目标
 func (p *Proxy) modifyRequestHeaders(ctx *fasthttp.RequestCtx, target *loadbalance.Target) {
 	headers := &ctx.Request.Header
+
+	normalizeUpstreamRequest(headers)
 
 	// 覆盖 Host 前提取原始请求信息，避免 X-Forwarded-Host 误用上游地址。
 	fh := ExtractForwardedHeaders(ctx)
@@ -71,6 +75,47 @@ func (p *Proxy) modifyRequestHeaders(ctx *fasthttp.RequestCtx, target *loadbalan
 		for _, key := range p.config.Headers.Remove {
 			headers.Del(key)
 		}
+	}
+}
+
+// hopByHopRequestHeaders 是不应转发给上游的 hop-by-hop 请求头（RFC 9110 7.6.1）。
+//
+// Connection 与 Transfer-Encoding 由 fasthttp 根据请求自行维护，不在此列。
+var hopByHopRequestHeaders = []string{
+	"Keep-Alive",
+	"Proxy-Connection",
+	"TE",
+	"Upgrade",
+}
+
+// normalizeUpstreamRequest 把入站请求规范化为可发往 HTTP/1.x 上游的形式。
+//
+// 入站请求经 HTTP/2、HTTP/3 适配器转换后，Request.Header 的协议为 "HTTP/2.0" 或
+// "HTTP/3"，fasthttp 客户端会把该值原样写进请求行（如 "GET /x HTTP/2.0"），
+// 导致 Python http.server 返回 505，fasthttp 上游解析失败，最终表现为 502。
+// 同时 fasthttp 会因非 HTTP/1.1 协议而追加 "Connection: close"，丢失上游连接复用。
+//
+// 处理：
+//   - 协议固定为 HTTP/1.1；
+//   - 删除 hop-by-hop 头部，以及 Connection 头部中列出的其他头部名。
+//
+// WebSocket 升级请求在 modifyRequestHeaders 之前已由独立路径处理，不受影响。
+func normalizeUpstreamRequest(headers *fasthttp.RequestHeader) {
+	headers.SetProtocol("HTTP/1.1")
+
+	if conn := headers.Peek("Connection"); len(conn) > 0 && !headers.ConnectionClose() {
+		// Connection 中列出的头部名均为 hop-by-hop，随 Connection 一并清除。
+		// 保留 Connection: close 以维持既有的连接关闭语义。
+		for _, token := range strings.Split(string(conn), ",") {
+			if token = strings.TrimSpace(token); token != "" && !strings.EqualFold(token, "keep-alive") {
+				headers.Del(token)
+			}
+		}
+		headers.Del("Connection")
+	}
+
+	for _, name := range hopByHopRequestHeaders {
+		headers.Del(name)
 	}
 }
 
